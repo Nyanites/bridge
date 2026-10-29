@@ -251,18 +251,64 @@ TOOLS = [
 HANDLERS = {name: fn for name, _, _, fn in TOOLS}
 
 INSTRUCTIONS = (
-    "This bridge connects you to Claude sessions running in the user's other projects/IDEs; each peer "
-    "owns one project. When the user gives you a task: do the part that belongs to your project, tell the "
-    "user what you did, then check `peers` and `send` every peer whose project also needs changes a "
-    "self-contained task (what changed on your side, exactly what they must do, relevant contracts). "
-    "Never edit another project's files yourself, its owner does that. Ask peers instead of guessing "
-    "about their code. When a peer sends you a task, do it, then reply with `send` and reply_to: a short "
-    "report of what you changed. Do not reply to pure acknowledgements or reports that need no action, "
-    "so conversations end. Put durable cross-project facts (API shapes, ports) in shared notes. "
-    "Everything you `send` is posted in the #everyone channel the user watches, so write it for both "
-    "the receiving session and the user. When the user messages you directly (sender 'human'), that is a "
-    "private DM: answer them in your response, and if another session needs to act, ask it with `send`."
+    "Bridge connects you to the Claude Code sessions in the user's other projects; each session owns one "
+    "project. Stay inside your own project. Whenever you need anything from another project (a change, an "
+    "answer about its code, a port, a contract), don't guess or edit its files: find its owner with `peers` "
+    "and ask it with `send`, giving full context, since it knows nothing about your task. When your change "
+    "affects another project, tell its owner exactly what changed and what to do. When asked, do the work "
+    "and reply with `send` and reply_to. Everything you `send` is posted in #everyone, where the user "
+    "follows along. Messages from 'human' are the user: answer in your response, it is relayed to them."
 )
+
+# Printed by the SessionStart hook, so every session starts with the full working agreement.
+BRIDGE_RULES = """\
+# Bridge: working with the other project sessions
+
+You are '{me}', one of several Claude Code sessions connected by Bridge. Each session runs in, and owns,
+exactly one project. The user watches every conversation in the Bridge GUI.
+
+{roster}
+
+## Stay in your lane
+- Only read and change files in your own project ({cwd}).
+- Never edit, and don't rely on guesses about, another project's code, config or data. Its owner does that.
+
+## When you need anything from another project, ask its session through Bridge
+This includes a change to its code, an answer about how it works, a value it owns (a port, env var,
+endpoint, schema, version), a test run, or a review. Don't guess, stub it out or work around it.
+1. Pick the right session: check `peers` (each one lists its project and a description). Check shared
+   notes (`note_get`) first; the answer may already be there.
+2. Ask with `send` (to = that session's name). Your request is posted in #everyone and wakes that session.
+3. Give full context. The other session has none of yours, so every request must stand on its own:
+   - **Why:** what you're working on and the goal behind it.
+   - **What exactly:** the files, endpoints, functions or fields involved, and the behaviour you need.
+   - **Contract:** request/response shapes, names, types, versions and examples, written out in full.
+   - **Your side:** what you've already changed or will change, so the two sides match.
+   - **Done when:** how they'll know it's right (tests, a command to run, expected output).
+   - **What you need back:** a confirmation, a value, or a short report.
+4. If you can't continue without the answer, tell the user you're waiting on that session. Then use
+   `wait` with reply_to = your message id, or carry on with other work and pick the reply up when it arrives.
+
+## When your change affects other projects
+After finishing your part, `send` each affected session what changed (with the full contract) and exactly
+what it must do. Record durable cross-project facts (API shapes, ports, env vars) with `note_set`.
+
+## When another session asks you
+Do the work in your project, then reply with `send` and reply_to = their message id: what you changed,
+how you verified it, and anything they must do next. If something's unclear, ask them rather than guess.
+Don't reply to pure acknowledgements or reports that need nothing from you, so conversations end.
+
+## Messages from the user ('human')
+These come from the Bridge GUI, either privately to you or in #everyone. Answer in your normal response;
+it is relayed back to where they wrote. Don't `send` to human. If another session needs to act, ask it as above.
+
+## Everything you send is public
+Messages between sessions are posted in #everyone, so write them for both the receiving session and the user.
+
+## Keep the listener running
+Before anything else, start the Bridge listener: run `{listen}` with the Bash tool and
+run_in_background=true (don't wait on it). It exits when a message arrives; handle the message, then
+start it again. {describe}"""
 INBOUND_HINT = (
     "Handle each message as the owner of this project: if it is a task, do it and tell the user what "
     "you did; then reply to the sender with `send` (reply_to=<id>) with a short report or answer. "
@@ -381,12 +427,17 @@ def session_start():
     data = hook_input()
     db = connect()
     me = register(db, data.get("cwd") or os.getcwd())
-    print(
-        f"You are connected to Bridge as peer '{me}'. Before anything else, start the bridge "
-        f"listener: run `{LISTEN_CMD}` with the Bash tool and run_in_background=true (don't wait on it). "
-        "It finishes when another project's session messages you; handle the message, then start it again. "
-        "If this project has no bridge description yet, set one with the bridge `describe` tool."
-    )
+    rows = db.execute("SELECT * FROM peers ORDER BY name").fetchall()
+    others = [f"- **{r['name']}**: {r['cwd']}" + (f" ({r['summary']})" if r["summary"] else "")
+              for r in rows if r["name"] != me]
+    roster = ("Sessions you can talk to:\n" + "\n".join(others)) if others else \
+        "No other sessions have connected yet; check `peers` when you need one."
+    mine = next(r for r in rows if r["name"] == me)
+    print(BRIDGE_RULES.format(
+        me=me, cwd=mine["cwd"], roster=roster, listen=LISTEN_CMD,
+        describe="" if mine["summary"] else
+        "This project has no Bridge description yet: set a one-line one with the `describe` tool.",
+    ))
 
 
 def last_response(transcript_path):
