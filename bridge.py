@@ -12,6 +12,7 @@ Usage:
     bridge.py session-start    # SessionStart hook: tells Claude to start the listener
     bridge.py stop             # Stop hook: delivers late messages, keeps the listener alive
     bridge.py send TO MESSAGE  # send a message from the terminal (as "human")
+    bridge.py quiet NAME [on|off]  # NAME skips messages to everyone (only @mentions reach it)
     bridge.py post TO MESSAGE [--image PATH]... [--reply-to ID]
                                # send as this folder's session, with images (sessions can run it via Bash)
     bridge.py peers            # list known sessions
@@ -79,6 +80,8 @@ def connect():
         "ALTER TABLE messages ADD COLUMN channel INTEGER NOT NULL DEFAULT 0",
         # JSON list of image paths under FILES_DIR
         "ALTER TABLE messages ADD COLUMN attachments TEXT",
+        # 1 when the session skips messages to everyone (broadcasts, posts without @mentions)
+        "ALTER TABLE peers ADD COLUMN quiet INTEGER NOT NULL DEFAULT 0",
     ):
         try:
             db.execute(migration)
@@ -242,7 +245,7 @@ class Bridge:
     def send(self, to, message, reply_to=None, attachments=None):
         recipients = [to]
         if to == "*":
-            recipients = [r["name"] for r in self.db.execute("SELECT name FROM peers WHERE name != ?", (self.me,))]
+            recipients = [r["name"] for r in self.db.execute("SELECT name FROM peers WHERE name != ? AND NOT quiet", (self.me,))]
         elif to != "human" and not self.db.execute("SELECT 1 FROM peers WHERE name = ?", (to,)).fetchone():
             return f"Unknown peer '{to}'. Known peers:\n{self.peers()}"
         files = store_attachments(attachments)
@@ -630,7 +633,7 @@ def gui_state(since):
     try:
         peers = [
             {"name": r["name"], "cwd": r["cwd"], "summary": r["summary"], "last_seen": r["last_seen"],
-             "listening": listener_alive(db, r["name"])}
+             "listening": listener_alive(db, r["name"]), "quiet": bool(r["quiet"])}
             for r in db.execute("SELECT * FROM peers ORDER BY name").fetchall()
         ]
         messages = [dict(r) for r in db.execute(
@@ -645,13 +648,19 @@ def gui_state(since):
         db.close()
 
 
-def gui_send(to, body, reply_to=None, channel=False, images=None):
+def gui_send(to, body, reply_to=None, channel=False, images=None, everyone=False):
     """Send as the human. `to` is a peer name, a list of them (@mentions in #everyone), or '*'.
-    `images` are uploads from the GUI: [{name, data: base64}]."""
+    '*' skips quiet sessions unless `everyone` (an explicit @everyone). `images` are GUI uploads: [{name, data: base64}]."""
     db = connect()
     try:
-        names = [r["name"] for r in db.execute("SELECT name FROM peers")]
-        recipients = names if to == "*" else [to] if isinstance(to, str) else list(dict.fromkeys(to))
+        peers = db.execute("SELECT name, quiet FROM peers").fetchall()
+        names = [r["name"] for r in peers]
+        if to == "*":
+            recipients = [r["name"] for r in peers if everyone or not r["quiet"]]
+            if not recipients:
+                raise ValueError("Every session skips posts to everyone; @mention the one you want.")
+        else:
+            recipients = [to] if isinstance(to, str) else list(dict.fromkeys(to))
         unknown = [r for r in recipients if r not in names]
         if not body.strip() and not images:
             raise ValueError("Empty message")
@@ -664,6 +673,16 @@ def gui_send(to, body, reply_to=None, channel=False, images=None):
             "VALUES ('human', ?, ?, ?, ?, ?, ?)",
             (r, body, reply_to, now, int(channel or to == "*"), json.dumps(files) if files else None),
         ).lastrowid for r in recipients]
+    finally:
+        db.close()
+
+
+def set_quiet(name, quiet):
+    """Make a session skip (or receive again) messages to everyone; @mentions always reach it."""
+    db = connect()
+    try:
+        if not db.execute("UPDATE peers SET quiet = ? WHERE name = ?", (int(quiet), name)).rowcount:
+            raise ValueError(f"Unknown peer '{name}'")
     finally:
         db.close()
 
@@ -736,6 +755,13 @@ def gui(port=8765, open_browser=True):
         def do_POST(self):
             if not self.allowed(True):
                 return self.respond(403, {"error": "forbidden"})
+            if self.path == "/api/quiet":
+                try:
+                    data = json.loads(self.rfile.read(int(self.headers.get("Content-Length") or 0)))
+                    set_quiet(str(data.get("name", "")), bool(data.get("quiet")))
+                except (ValueError, TypeError) as e:
+                    return self.respond(400, {"error": str(e)})
+                return self.respond(200, {"ok": True})
             if self.path != "/api/send":
                 return self.respond(404, {"error": "not found"})
             try:
@@ -746,7 +772,8 @@ def gui(port=8765, open_browser=True):
                 images = data.get("images") or []
                 if not isinstance(images, list) or not all(isinstance(i, dict) for i in images):
                     raise ValueError("Bad images")
-                ids = gui_send(to, str(data.get("body", "")), reply_to, bool(data.get("channel")), images)
+                ids = gui_send(to, str(data.get("body", "")), reply_to, bool(data.get("channel")), images,
+                               bool(data.get("everyone")))
             except (ValueError, TypeError) as e:
                 return self.respond(400, {"error": str(e)})
             self.respond(200, {"ids": ids})
@@ -831,6 +858,9 @@ main { flex: 1; display: flex; min-width: 0; }
 #thread .x { margin-left: auto; border: 0; background: none; color: var(--muted); font-size: 24px; line-height: 1;
   cursor: pointer; padding: 0 4px; }
 #thread .x:hover { color: var(--strong); }
+.toggle { margin-left: auto; flex: none; border: 1px solid var(--line); border-radius: 6px; background: none;
+  color: var(--text); font-size: 13px; padding: 4px 10px; cursor: pointer; }
+.toggle:hover { background: var(--hover); }
 .tdiv { display: flex; align-items: center; gap: 8px; padding: 8px 16px 0; color: var(--muted); font-size: 13px; }
 .tdiv::after { content: ""; flex: 1; border-top: 1px solid var(--line); }
 .thread-sum { display: flex; align-items: center; gap: 6px; width: fit-content; margin-top: 4px; padding: 3px 8px 3px 4px;
@@ -924,7 +954,8 @@ textarea { flex: 1; border: 0; outline: 0; resize: none; background: transparent
 </aside>
 <main>
   <div class="chat">
-    <header><span class="title" id="title"></span><span class="topic" id="topic"></span></header>
+    <header><span class="title" id="title"></span><span class="topic" id="topic"></span>
+      <button type="button" class="toggle" id="quiet" hidden></button></header>
     <div class="log" id="log"></div>
     <form id="compose">
       <div class="mentions" hidden></div>
@@ -1101,7 +1132,7 @@ function withMentions(body) {
 function targets(g) {
   if (g.rows[0].recipient === "human") return ["You"];
   const to = new Set(g.rows.map(r => r.recipient));
-  const all = peers.filter(p => p.name !== g.sender).every(p => to.has(p.name));
+  const all = peers.filter(p => p.name !== g.sender && !p.quiet).every(p => to.has(p.name));
   const said = new Set(mentionsIn(g.body));
   if (all && g.everyone) return said.size ? [] : ["everyone"];
   return [...to].filter(n => !said.has(n));
@@ -1125,7 +1156,7 @@ function renderSidebar(M) {
   $("dms").replaceChildren(...peers.map(p => {
     const n = view === p.name ? 0 : unreadDM(M, p.name);
     replies += n;
-    const sub = (p.listening ? "listening" : "not listening") + (p.summary ? " · " + p.summary : "");
+    const sub = (p.listening ? "listening" : "not listening") + (p.quiet ? " · 🔕" : "") + (p.summary ? " · " + p.summary : "");
     const item = sidebarItem(p.name, avatar(p.name, p), p.name, sub, n);
     item.title = p.cwd + (p.summary ? "\n" + p.summary : "");
     return item;
@@ -1298,10 +1329,10 @@ function notify(M) {
   }
 }
 
+const peerSig = () => peers.map(p => [p.name, p.listening, p.summary, p.cwd, p.quiet]);
 function render() {
   if (view !== CHANNEL && !peers.some(p => p.name === view)) view = CHANNEL;
-  drawn = JSON.stringify([since, [...unread], peers.map(p => [p.name, p.listening, p.summary, p.cwd]),
-                          view, thread, Math.floor(serverNow() / 60)]);
+  drawn = JSON.stringify([since, [...unread], peerSig(), view, thread, Math.floor(serverNow() / 60)]);
   const M = model();
   markRead(M);
   const dm = view !== CHANNEL;
@@ -1310,8 +1341,21 @@ function render() {
   $("topic").textContent = dm ? "Private · " + (peer && peer.summary || peer && peer.cwd || "")
                               : "Sessions coordinating with each other";
   main.input.placeholder = dm ? "Message @" + view : "Message #everyone · type @ to mention a session";
-  $("compose").querySelector(".hint").textContent =
-    (dm ? "Only " + view + " sees this · " : "@mention sessions to ask just them · ") + "Enter to send · Shift+Enter for a new line · paste or drop images";
+  const quiet = peers.filter(p => p.quiet).map(p => p.name);
+  $("compose").querySelector(".hint").textContent = (dm ? "Only " + view + " sees this · "
+    : "@mention sessions to ask just them" + (quiet.length ? " (no @mention skips " + quiet.join(", ") + ")" : "") + " · ")
+    + "Enter to send · Shift+Enter for a new line · paste or drop images";
+  const q = $("quiet");
+  q.hidden = !dm || !peer;
+  if (peer) {
+    q.textContent = peer.quiet ? "🔕 Skips posts to everyone" : "🔔 Gets posts to everyone";
+    q.title = (peer.quiet ? "Only @" + peer.name + " mentions reach it. Click to include it in posts to everyone."
+                          : "Click to stop posts without an @mention (and session broadcasts) from reaching " + peer.name + ".");
+    q.onclick = async () => {
+      try { await api("/api/quiet", {name: peer.name, quiet: !peer.quiet}); peer.quiet = !peer.quiet; render(); }
+      catch (e) { alert("Couldn't change it: " + e.message); }
+    };
+  }
   renderSidebar(M);
   renderMain(M);
   renderThread(M);
@@ -1379,8 +1423,7 @@ async function poll() {
     }
     // Redraw only when something visible changed (plus once a minute for "2m ago" times). Rebuilding on
     // every poll made the page flash, and peers' last_seen ticks every second, so it isn't part of this.
-    const state = JSON.stringify([since, s.unread, peers.map(p => [p.name, p.listening, p.summary, p.cwd]),
-                                  view, thread, Math.floor(serverNow() / 60)]);
+    const state = JSON.stringify([since, s.unread, peerSig(), view, thread, Math.floor(serverNow() / 60)]);
     if (state !== drawn) render();
     const notes = JSON.stringify(s.notes);
     if (notes !== notesDrawn) { notesDrawn = notes; renderNotes(s.notes); }
@@ -1511,7 +1554,8 @@ function composer(form, payload, canMention, dropZone) {
 const main = composer($("compose"), body => {
   if (view !== CHANNEL) return {to: view, body};
   const tagged = mentionsIn(body);
-  return {to: !tagged.length || tagged.includes("everyone") ? "*" : tagged, body, channel: true};
+  const everyone = tagged.includes("everyone");
+  return {to: !tagged.length || everyone ? "*" : tagged, everyone, body, channel: true};
 }, () => view === CHANNEL, document.querySelector(".chat"));
 const side = composer($("tcompose"), body => {
   const M = model(), root = M.roots.find(g => g.key === thread);
@@ -1546,6 +1590,13 @@ def cli(argv):
         db = connect()
         for r in db.execute("SELECT * FROM peers ORDER BY last_seen DESC"):
             print(f"{r['name']:20} {ago(r['last_seen']):>9}  {r['cwd']}  {r['summary']}")
+    elif cmd == "quiet" and len(argv) >= 2:
+        on = (argv[2] if len(argv) > 2 else "on").lower() not in ("off", "no", "0", "false")
+        try:
+            set_quiet(argv[1], on)
+        except ValueError as e:
+            sys.exit(f"Error: {e}")
+        print(f"{argv[1]} {'skips' if on else 'gets'} messages to everyone; @mentions always reach it.")
     elif cmd == "post":
         import argparse
         p = argparse.ArgumentParser(prog="bridge.py post", description="Send as the session that owns this folder.")

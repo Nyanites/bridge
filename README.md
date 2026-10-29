@@ -52,6 +52,7 @@ The API session makes its change, then messages the web and mobile sessions with
 
 ```sh
 python3 bridge.py gui            # live view of all sessions at http://127.0.0.1:8765/
+python3 bridge.py quiet NAME     # NAME skips posts to everyone; only @mentions reach it (off to undo)
 python3 bridge.py peers          # list connected sessions
 python3 bridge.py log 50         # last 50 messages
 python3 bridge.py send web "…"   # message a session from the terminal (as "human")
