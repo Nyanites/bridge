@@ -225,7 +225,9 @@ TOOLS = [
      schema({}), lambda b, a: b.peers()),
     ("describe", "Set a one-line description of what this project/session is, shown to other peers.",
      schema({"summary": STR}, ["summary"]), lambda b, a: b.describe(a["summary"])),
-    ("send", "Send a message to another session by peer name ('*' broadcasts to all). Use reply_to with a message id when answering.",
+    ("send", "Post a message in the shared #everyone channel, @mentioning another session by peer name; that session is "
+             "woken to handle it and the user sees it in the channel. '*' addresses every session. Use reply_to with a "
+             "message id when answering.",
      schema({"to": STR, "message": STR, "reply_to": INT}, ["to", "message"]),
      lambda b, a: b.send(a["to"], a["message"], a.get("reply_to"))),
     ("inbox", "Read (and mark read) new messages sent to this session.",
@@ -249,14 +251,18 @@ INSTRUCTIONS = (
     "Never edit another project's files yourself, its owner does that. Ask peers instead of guessing "
     "about their code. When a peer sends you a task, do it, then reply with `send` and reply_to: a short "
     "report of what you changed. Do not reply to pure acknowledgements or reports that need no action, "
-    "so conversations end. Put durable cross-project facts (API shapes, ports) in shared notes."
+    "so conversations end. Put durable cross-project facts (API shapes, ports) in shared notes. "
+    "Everything you `send` is posted in the #everyone channel the user watches, so write it for both "
+    "the receiving session and the user. When the user messages you directly (sender 'human'), that is a "
+    "private DM: answer them in your response, and if another session needs to act, ask it with `send`."
 )
 INBOUND_HINT = (
     "Handle each message as the owner of this project: if it is a task, do it and tell the user what "
     "you did; then reply to the sender with `send` (reply_to=<id>) with a short report or answer. "
     "If it is just a report or acknowledgement needing nothing from you, don't reply; summarise it for the user. "
-    "Messages from 'human' come from the user via the bridge GUI: your final response is relayed back to them "
-    "automatically, so just answer in your response instead of using `send`."
+    "Messages from 'human' are the user's private DM to you from the bridge GUI: your final response is relayed "
+    "back to that DM automatically, so answer in your response instead of `send`ing to human. If another "
+    "session needs to act, ask it with `send`; that posts in the #everyone channel where it and the user see it."
 )
 
 
@@ -552,84 +558,127 @@ GUI_PAGE = r"""<!doctype html>
 <title>Bridge</title>
 <style>
 :root {
-  --bg: #f6f6f4; --panel: #ffffff; --line: #e3e2de; --text: #1f1f1d; --muted: #6f6e69;
-  --accent: #c2410c; --mine: #fff1e3; --hl: #fde68a; --ok: #16a34a; --idle: #a8a29e;
+  --side: #f2f3f5; --main: #ffffff; --hover: #f2f3f5; --sel: #e3e5e8; --text: #313338; --strong: #060607;
+  --muted: #5c5e66; --line: #e3e5e8; --input: #ebedef; --accent: #7c3aed; --red: #e5383b; --ok: #23a55a;
+  --idle: #80848e; --mention: rgba(124, 58, 237, .14); --mention-text: #6d28d9; --flash: rgba(250, 204, 21, .25);
 }
 @media (prefers-color-scheme: dark) {
   :root {
-    --bg: #161615; --panel: #1f1f1d; --line: #33322f; --text: #ecebe7; --muted: #9b9a94;
-    --accent: #fb923c; --mine: #3a2a1c; --hl: #5b4a12; --ok: #4ade80; --idle: #57534e;
+    --side: #2b2d31; --main: #313338; --hover: #2e3035; --sel: #404249; --text: #dbdee1; --strong: #f2f3f5;
+    --muted: #949ba4; --line: #3f4147; --input: #383a40; --accent: #8b5cf6; --red: #f23f43; --ok: #23a55a;
+    --idle: #80848e; --mention: rgba(139, 92, 246, .22); --mention-text: #c4b5fd; --flash: rgba(250, 204, 21, .14);
   }
 }
 * { box-sizing: border-box; }
-body { margin: 0; height: 100vh; display: flex; background: var(--bg); color: var(--text);
-  font: 14px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
-aside { width: 280px; flex: none; border-right: 1px solid var(--line); background: var(--panel);
-  display: flex; flex-direction: column; overflow-y: auto; }
-aside h2 { font-size: 11px; text-transform: uppercase; letter-spacing: .06em; color: var(--muted);
-  margin: 16px 16px 6px; }
-.view { padding: 8px 16px; cursor: pointer; border-left: 3px solid transparent; }
-.view:hover { background: var(--bg); }
-.view.active { border-left-color: var(--accent); background: var(--bg); }
-.view .name { font-weight: 600; display: flex; align-items: center; gap: 6px; }
-.view .name .count { margin-left: auto; }
-.view .meta { color: var(--muted); font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.dot { width: 8px; height: 8px; border-radius: 50%; background: var(--idle); flex: none; }
-.dot.on { background: var(--ok); }
-details, .nonotes { padding: 0 16px 6px; font-size: 12px; }
-.nonotes { margin: 0; color: var(--muted); }
-details summary { cursor: pointer; font-weight: 600; }
-details pre { white-space: pre-wrap; margin: 4px 0 8px; color: var(--muted); font-size: 12px; }
+body { margin: 0; height: 100vh; display: flex; background: var(--main); color: var(--text);
+  font: 15px/1.375 -apple-system, BlinkMacSystemFont, "Segoe UI", "gg sans", sans-serif; }
+button { font: inherit; }
+
+/* sidebar */
+aside { width: 260px; flex: none; background: var(--side); display: flex; flex-direction: column; min-height: 0; }
+.ws { height: 52px; flex: none; display: flex; align-items: center; gap: 10px; padding: 0 16px;
+  border-bottom: 1px solid var(--line); font-weight: 700; color: var(--strong); }
+.ws .logo { width: 26px; height: 26px; border-radius: 8px; background: linear-gradient(135deg, #8b5cf6, #5b21b6);
+  display: grid; place-items: center; color: #fff; font-size: 14px; }
+.ws #status { margin-left: auto; font-size: 12px; font-weight: 500; color: var(--muted); }
+.side-scroll { flex: 1; overflow-y: auto; padding: 8px 8px 16px; }
+.section { font-size: 12px; font-weight: 700; text-transform: uppercase; letter-spacing: .02em;
+  color: var(--muted); padding: 16px 8px 4px; }
+.item { display: flex; align-items: center; gap: 10px; padding: 6px 8px; border-radius: 6px; cursor: pointer;
+  color: var(--muted); }
+.item:hover { background: var(--hover); color: var(--text); }
+.item.active { background: var(--sel); color: var(--strong); }
+.item.unread { color: var(--strong); font-weight: 700; }
+.item .hash { width: 20px; text-align: center; font-size: 20px; font-weight: 400; color: var(--muted); }
+.item .label { flex: 1; min-width: 0; }
+.item .label div { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.item .label .sub { font-size: 12px; font-weight: 400; color: var(--muted); }
+.pill { min-width: 18px; height: 18px; padding: 0 5px; border-radius: 9px; background: var(--red); color: #fff;
+  font-size: 12px; font-weight: 700; line-height: 18px; text-align: center; flex: none; }
+.avatar { position: relative; width: 32px; height: 32px; border-radius: 50%; flex: none; display: grid;
+  place-items: center; color: #fff; font-weight: 700; font-size: 14px; text-transform: uppercase; }
+.avatar .st { position: absolute; right: -2px; bottom: -2px; width: 12px; height: 12px; border-radius: 50%;
+  background: var(--idle); border: 3px solid var(--side); box-sizing: content-box; transform: translate(2px, 2px); }
+.avatar .st.on { background: var(--ok); }
+details { padding: 2px 8px; font-size: 13px; }
+details summary { cursor: pointer; color: var(--text); }
+details pre { white-space: pre-wrap; margin: 4px 0 8px; color: var(--muted); font: 12px/1.4 ui-monospace, Menlo, monospace; }
+.nonotes { margin: 0; padding: 2px 8px; font-size: 13px; color: var(--muted); }
+.notify { margin: 8px; padding: 10px; border-radius: 8px; background: var(--main); font-size: 13px; color: var(--muted); }
+.notify button { margin-top: 6px; width: 100%; border: 0; border-radius: 4px; padding: 6px; background: var(--accent);
+  color: #fff; font-weight: 600; cursor: pointer; }
+
+/* main */
 main { flex: 1; display: flex; flex-direction: column; min-width: 0; }
-header { padding: 12px 20px; border-bottom: 1px solid var(--line); display: flex; gap: 12px;
-  justify-content: space-between; align-items: center; background: var(--panel); }
-header h1 { font-size: 15px; margin: 0; }
-header .sub { font-size: 12px; color: var(--muted); }
-#status { font-size: 12px; color: var(--muted); white-space: nowrap; }
-#log { flex: 1; overflow-y: auto; padding: 16px 20px; display: flex; flex-direction: column; }
-.msg { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 8px 12px;
-  margin-bottom: 10px; max-width: 900px; transition: background .4s; }
-.dm .msg { max-width: min(720px, 85%); align-self: flex-start; border-radius: 12px 12px 12px 4px; }
-.dm .msg.mine { align-self: flex-end; background: var(--mine); border-radius: 12px 12px 4px 12px; }
-.msg.flash { background: var(--hl); }
-.msg .head { font-size: 12px; color: var(--muted); display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
-.msg .who { font-weight: 600; color: var(--text); }
-.msg .body { white-space: pre-wrap; word-wrap: break-word; margin-top: 4px; }
-.badge { font-size: 11px; padding: 0 6px; border-radius: 9px; background: var(--accent); color: #fff; }
-.tag { font-size: 11px; padding: 0 6px; border-radius: 9px; border: 1px solid var(--line); }
-a.ref { color: var(--accent); cursor: pointer; text-decoration: none; }
-.empty { color: var(--muted); text-align: center; margin-top: 40px; }
-form { display: flex; gap: 8px; padding: 12px 20px; border-top: 1px solid var(--line); background: var(--panel); }
-textarea, button { font: inherit; color: var(--text); background: var(--bg);
-  border: 1px solid var(--line); border-radius: 6px; padding: 6px 8px; }
-textarea { flex: 1; resize: vertical; min-height: 38px; height: 38px; }
-button { background: var(--accent); color: #fff; border: none; padding: 6px 16px; cursor: pointer; }
-@media (max-width: 700px) { body { flex-direction: column; } aside { width: auto; max-height: 35vh;
-  border-right: none; border-bottom: 1px solid var(--line); } }
+header { height: 52px; flex: none; display: flex; align-items: center; gap: 10px; padding: 0 16px;
+  border-bottom: 1px solid var(--line); }
+header .title { font-weight: 700; color: var(--strong); white-space: nowrap; }
+header .topic { color: var(--muted); font-size: 14px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  padding-left: 10px; border-left: 1px solid var(--line); }
+#log { flex: 1; overflow-y: auto; padding: 16px 0 8px; }
+.intro { padding: 16px 16px 20px; }
+.intro .big { width: 64px; height: 64px; border-radius: 50%; display: grid; place-items: center; font-size: 30px;
+  background: var(--sel); color: var(--strong); margin-bottom: 8px; }
+.intro h2 { margin: 0 0 4px; font-size: 26px; color: var(--strong); }
+.intro p { margin: 0; color: var(--muted); }
+.msg { display: grid; grid-template-columns: 40px 1fr; column-gap: 16px; padding: 2px 16px; margin-top: 16px;
+  transition: background .4s; }
+.msg.cont { margin-top: 0; }
+.msg:hover { background: var(--hover); }
+.msg.flash { background: var(--flash); }
+.msg .reply { grid-column: 2; font-size: 13px; color: var(--muted); display: flex; align-items: center; gap: 6px;
+  cursor: pointer; overflow: hidden; white-space: nowrap; position: relative; margin-bottom: 2px; }
+.msg .reply::before { content: ""; position: absolute; left: -36px; top: 8px; width: 30px; height: 10px;
+  border-left: 2px solid var(--line); border-top: 2px solid var(--line); border-top-left-radius: 6px; }
+.msg .reply b { color: var(--text); }
+.msg .reply span { overflow: hidden; text-overflow: ellipsis; }
+.msg .reply:hover span { color: var(--text); }
+.intro .avatar.xl { width: 64px; height: 64px; font-size: 28px; margin-bottom: 8px; }
+.intro .avatar.xl .st { border-color: var(--main); }
+.msg > .avatar { width: 40px; height: 40px; font-size: 16px; grid-row: span 2; margin-top: 2px; }
+.msg.cont > .avatar { visibility: hidden; height: 0; }
+.msg .meta { display: flex; align-items: baseline; gap: 8px; }
+.msg .name { font-weight: 600; color: var(--strong); }
+.msg .time { font-size: 12px; color: var(--muted); }
+.msg .text { white-space: pre-wrap; word-wrap: break-word; }
+.mention { background: var(--mention); color: var(--mention-text); border-radius: 4px; padding: 0 3px; font-weight: 600; }
+.msg .state { font-size: 12px; color: var(--muted); margin-top: 2px; }
+form { padding: 0 16px 20px; }
+.box { display: flex; align-items: flex-end; background: var(--input); border-radius: 8px; padding: 0 12px; }
+textarea { flex: 1; border: 0; outline: 0; resize: none; background: transparent; color: var(--text); font: inherit;
+  padding: 11px 0; max-height: 40vh; height: 44px; }
+.hint { font-size: 12px; color: var(--muted); padding: 4px 2px 0; }
+@media (max-width: 700px) { body { flex-direction: column; } aside { width: auto; max-height: 40vh; } }
 </style>
 </head>
 <body>
 <aside>
-  <div id="channel"></div>
-  <h2>Direct messages</h2>
-  <div id="dms"></div>
-  <h2>Shared notes</h2>
-  <div id="notes"></div>
+  <div class="ws"><div class="logo">B</div>Bridge<span id="status">connecting…</span></div>
+  <div class="side-scroll">
+    <div class="section">Channels</div>
+    <div id="channels"></div>
+    <div class="section">Direct messages</div>
+    <div id="dms"></div>
+    <div class="section">Shared notes</div>
+    <div id="notes"></div>
+  </div>
+  <div id="notify"></div>
 </aside>
 <main>
-  <header><div><h1 id="title"></h1><div class="sub" id="sub"></div></div><span id="status">connecting…</span></header>
+  <header><span class="title" id="title"></span><span class="topic" id="topic"></span></header>
   <div id="log"></div>
   <form id="compose">
-    <textarea id="body"></textarea>
-    <button>Send</button>
+    <div class="box"><textarea id="body" rows="1"></textarea></div>
+    <div class="hint">Enter to send · Shift+Enter for a new line</div>
   </form>
 </main>
 <script>
 const TOKEN = "__TOKEN__";
-const CHANNEL = "#channel";
+const CHANNEL = "#everyone";
 const $ = id => document.getElementById(id);
 const fromHash = decodeURIComponent(location.hash.slice(1));
-let since = 0, view = fromHash && fromHash !== "channel" ? fromHash : CHANNEL, peers = [], messages = [], unread = new Set(), skew = 0;
+let since = 0, view = fromHash && fromHash !== "everyone" ? fromHash : CHANNEL, peers = [], messages = [];
+let unread = new Set(), skew = 0, notified = 0;
 let lastRead = {};  // view -> highest message id seen there (this browser only)
 try { lastRead = JSON.parse(localStorage.getItem("bridge.lastRead")) || {}; } catch (e) {}
 const firstVisit = !Object.keys(lastRead).length;
@@ -640,13 +689,35 @@ function el(tag, cls, text) {
   if (text != null) e.textContent = text;
   return e;
 }
+const serverNow = () => Date.now() / 1000 - skew;
+function when(ts) {
+  const d = new Date(ts * 1000), now = new Date(serverNow() * 1000);
+  const t = d.toLocaleTimeString([], {hour: "numeric", minute: "2-digit"});
+  if (d.toDateString() === now.toDateString()) return "Today at " + t;
+  const y = new Date(now); y.setDate(now.getDate() - 1);
+  if (d.toDateString() === y.toDateString()) return "Yesterday at " + t;
+  return d.toLocaleDateString() + " " + t;
+}
 function ago(ts) {
-  const s = Math.max(0, Math.floor(Date.now() / 1000 - skew - ts));
-  if (s < 60) return s + "s ago";
+  const s = Math.max(0, Math.floor(serverNow() - ts));
+  if (s < 60) return "just now";
   if (s < 3600) return Math.floor(s / 60) + "m ago";
   if (s < 86400) return Math.floor(s / 3600) + "h ago";
   return Math.floor(s / 86400) + "d ago";
 }
+function avatar(name, peer) {
+  let h = 0;
+  for (const c of name) h = (h * 31 + c.charCodeAt(0)) % 360;
+  const a = el("div", "avatar", name === "human" ? "Y" : name[0]);
+  a.style.background = name === "human" ? "var(--accent)" : `hsl(${h} 55% 45%)`;
+  if (peer) {
+    const st = el("span", "st" + (peer.listening ? " on" : ""));
+    st.title = peer.listening ? "Listening: messages wake this session" : "Not listening: messages wait for its next prompt";
+    a.append(st);
+  }
+  return a;
+}
+const display = name => name === "human" ? "You" : name;
 async function api(path, body) {
   const r = await fetch(path, {
     method: body ? "POST" : "GET",
@@ -658,7 +729,7 @@ async function api(path, body) {
   return data;
 }
 
-// A broadcast is stored as one row per recipient; fold those back into one item.
+// A message to several recipients is stored as one row each; fold those back into one post.
 function groups() {
   const out = [];
   for (const m of messages) {
@@ -670,60 +741,56 @@ function groups() {
       out.push({sender: m.sender, body: m.body, created: m.created, reply_to: m.reply_to, rows: [m]});
     }
   }
+  for (const g of out) g.everyone = g.rows.length > 1;
   return out;
 }
-const isBroadcast = g => g.rows.length > 1;
-// Which views a group shows up in: broadcasts and session-to-session talk go to the channel;
-// anything between you and one session is a DM (your broadcast copies also show in each DM for context).
+// Sessions talk in #everyone, addressed with @mentions. You and one session talk in a private DM;
+// your posts to everyone also appear in each DM so its replies have context.
 function viewsOf(g) {
-  if (g.sender === "human") return isBroadcast(g) ? [CHANNEL, ...g.rows.map(r => r.recipient)] : [g.rows[0].recipient];
+  if (g.sender === "human") return g.everyone ? [CHANNEL, ...g.rows.map(r => r.recipient)] : [g.rows[0].recipient];
   if (g.rows[0].recipient === "human") return [g.sender];
   return [CHANNEL];
 }
-function itemsFor(v) {
-  const out = [];
-  for (const g of groups()) {
-    if (!viewsOf(g).includes(v)) continue;
-    // in a DM, show only that session's copy of a broadcast
-    const broadcast = isBroadcast(g);
-    out.push(v === CHANNEL ? {...g, broadcast} : {...g, broadcast, rows: g.rows.filter(r => r.sender !== "human" || r.recipient === v)});
-  }
-  return out;
+function itemsFor(v, all = groups()) {
+  return all.filter(g => viewsOf(g).includes(v))
+            .map(g => v === CHANNEL ? g : {...g, rows: g.rows.filter(r => r.sender !== "human" || r.recipient === v)});
 }
-function unreadCount(v) {
+function unreadCount(v, all) {
   const seen = lastRead[v] || 0;
-  return itemsFor(v).filter(g => g.sender !== "human" && Math.max(...g.rows.map(r => r.id)) > seen).length;
+  return itemsFor(v, all).filter(g => g.sender !== "human" && Math.max(...g.rows.map(r => r.id)) > seen).length;
 }
-function markRead(v) {
-  const ids = itemsFor(v).flatMap(g => g.rows.map(r => r.id));
+function markRead(v, all) {
+  const ids = itemsFor(v, all).flatMap(g => g.rows.map(r => r.id));
   if (!ids.length) return;
   lastRead[v] = Math.max(lastRead[v] || 0, ...ids);
   try { localStorage.setItem("bridge.lastRead", JSON.stringify(lastRead)); } catch (e) {}
 }
 
-function viewEntry(v, label, meta, extra) {
-  const d = el("div", "view" + (view === v ? " active" : ""));
-  const name = el("div", "name");
-  if (extra) name.append(extra);
-  name.append(el("span", null, label));
-  const n = view === v ? 0 : unreadCount(v);
-  if (n) name.append(el("span", "badge count", String(n)));
-  d.append(name, el("div", "meta", meta));
+function sidebarItem(v, icon, label, sub, count) {
+  const d = el("div", "item" + (view === v ? " active" : "") + (count ? " unread" : ""));
+  const l = el("div", "label");
+  l.append(el("div", null, label));
+  if (sub) l.append(el("div", "sub", sub));
+  d.append(icon, l);
+  if (count) d.append(el("span", "pill", count > 99 ? "99+" : String(count)));
   d.onclick = () => setView(v);
   return d;
 }
 
-function renderSidebar() {
-  $("channel").replaceChildren(viewEntry(CHANNEL, "# Channel", "sessions talking to each other"));
+function renderSidebar(all) {
+  const chCount = view === CHANNEL ? 0 : unreadCount(CHANNEL, all);
+  $("channels").replaceChildren(sidebarItem(CHANNEL, el("span", "hash", "#"), "everyone", null, chCount));
+  let replies = 0;
   $("dms").replaceChildren(...peers.map(p => {
-    const dot = el("span", "dot" + (p.listening ? " on" : ""));
-    dot.title = p.listening ? "listener running: messages wake this session"
-                            : "no listener: messages wait until this session's next prompt";
-    const e = viewEntry(p.name, p.name, (p.listening ? "listening" : "not listening") + " · seen " + ago(p.last_seen)
-                        + (p.summary ? " · " + p.summary : ""), dot);
-    e.title = p.cwd + (p.summary ? "\n" + p.summary : "");
-    return e;
+    const n = view === p.name ? 0 : unreadCount(p.name, all);
+    replies += n;
+    const sub = (p.listening ? "listening" : "not listening") + (p.summary ? " · " + p.summary : "");
+    const item = sidebarItem(p.name, avatar(p.name, p), p.name, sub, n);
+    item.title = p.cwd + (p.summary ? "\n" + p.summary : "");
+    return item;
   }));
+  const total = replies + chCount;
+  document.title = total ? `(${total}) Bridge` : "Bridge";
 }
 
 function renderNotes(notes) {
@@ -737,55 +804,96 @@ function renderNotes(notes) {
   }
 }
 
-function renderLog() {
+function renderNotify() {
+  const box = $("notify");
+  box.replaceChildren();
+  if (!("Notification" in window) || Notification.permission !== "default") return;
+  const d = el("div", "notify", "Get a desktop notification when a session replies to you.");
+  const b = el("button", null, "Turn on notifications");
+  b.type = "button";
+  b.onclick = () => Notification.requestPermission().then(renderNotify);
+  d.append(b);
+  box.append(d);
+}
+
+function renderLog(all) {
   const log = $("log");
-  const atBottom = log.scrollHeight - log.scrollTop - log.clientHeight < 40;
+  const atBottom = log.scrollHeight - log.scrollTop - log.clientHeight < 60;
   const dm = view !== CHANNEL;
-  log.className = dm ? "dm" : "";
+  const peer = peers.find(p => p.name === view);
   log.replaceChildren();
-  const items = itemsFor(view);
-  if (!items.length) log.append(el("div", "empty", dm ? "No messages with " + view + " yet. Only you and " + view + " see this conversation."
-                                                    : "Nothing yet. Messages between sessions, and anything you send to everyone, show up here."));
-  for (const g of items) {
-    const mine = g.sender === "human";
-    const d = el("div", "msg" + (mine ? " mine" : ""));
+  const intro = el("div", "intro");
+  if (dm) {
+    const a = avatar(view, peer);
+    a.classList.add("xl");
+    intro.append(a, el("h2", null, view),
+                 el("p", null, "This is your private conversation with " + view + (peer && peer.summary ? " (" + peer.summary + ")" : "")
+                               + ". Its answers to you land here. When it needs another session, it asks in #everyone."));
+  } else {
+    intro.append(el("div", "big", "#"), el("h2", null, "Welcome to #everyone"),
+                 el("p", null, "Where the sessions talk to each other. A request addressed to a session @mentions it and wakes it up. Posting here reaches every session."));
+  }
+  log.append(intro);
+  const byId = new Map(messages.map(m => [m.id, m]));
+  let prev = null;
+  for (const g of itemsFor(view, all)) {
+    const cont = prev && prev.sender === g.sender && !g.reply_to && g.created - prev.created < 300;
+    const d = el("div", "msg" + (cont ? " cont" : ""));
     d.dataset.ids = " " + g.rows.map(r => r.id).join(" ") + " ";
-    const head = el("div", "head");
-    if (dm) {
-      head.append(el("span", "who", mine ? "you" : g.sender));
-      if (mine && g.broadcast) head.append(el("span", "tag", "to everyone"));
-    } else {
-      const to = g.broadcast ? "everyone" : g.rows[0].recipient;
-      head.append(el("span", "who", (mine ? "you" : g.sender) + " → " + to));
+    const ref = g.reply_to && byId.get(g.reply_to);
+    if (ref) {
+      const r = el("div", "reply");
+      r.append(el("b", null, display(ref.sender)), el("span", null, ref.body.replace(/\s+/g, " ")));
+      r.onclick = () => jump(g.reply_to);
+      d.append(r);
     }
-    if (g.reply_to) {
-      const a = el("a", "ref", "↩ #" + g.reply_to);
-      a.onclick = () => jump(g.reply_to);
-      head.append(a);
+    d.append(avatar(g.sender));
+    const c = el("div", "content");
+    if (!cont) {
+      const meta = el("div", "meta");
+      const t = el("span", "time", when(g.created));
+      t.title = new Date(g.created * 1000).toLocaleString();
+      meta.append(el("span", "name", display(g.sender)), t);
+      c.append(meta);
     }
-    head.append(el("span", null, ago(g.created)));
+    const text = el("div", "text");
+    const to = g.everyone ? "@everyone" : dm ? null : "@" + g.rows[0].recipient;
+    if (to) text.append(el("span", "mention", to), " ");
+    text.append(g.body);
+    c.append(text);
     const waiting = g.rows.filter(r => unread.has(r.id) && r.recipient !== "human").map(r => r.recipient);
-    if (waiting.length) {
-      const b = el("span", "badge", g.broadcast && !dm ? "waiting: " + waiting.join(", ") : "not picked up yet");
-      b.title = "The recipient hasn't read this yet";
-      head.append(b);
-    }
-    d.append(head, el("div", "body", g.body));
+    if (waiting.length) c.append(el("div", "state", "⏳ Waiting for " + waiting.join(", ") + " to pick this up"));
+    d.append(c);
     log.append(d);
+    prev = g;
   }
   if (atBottom) log.scrollTop = log.scrollHeight;
 }
 
+function notify(all) {
+  // desktop notification for new replies to you, unless you're already looking at that DM
+  const fresh = messages.filter(m => m.recipient === "human" && m.id > notified);
+  if (fresh.length) notified = fresh[fresh.length - 1].id;
+  if (!("Notification" in window) || Notification.permission !== "granted") return;
+  for (const m of fresh) {
+    if (!document.hidden && view === m.sender) continue;
+    const n = new Notification(m.sender + " replied", {body: m.body.slice(0, 200), tag: "bridge-" + m.id});
+    n.onclick = () => { window.focus(); setView(m.sender); n.close(); };
+  }
+}
+
 function render() {
   if (view !== CHANNEL && !peers.some(p => p.name === view)) view = CHANNEL;
-  markRead(view);
+  const all = groups();
+  if (!document.hidden) markRead(view, all);
   const dm = view !== CHANNEL;
-  $("title").textContent = dm ? "@ " + view : "# Channel";
-  $("sub").textContent = dm ? "Private: just you and " + view + ". Its answers to you land here."
-                            : "Sessions talking to each other, and messages you send to everyone.";
-  $("body").placeholder = (dm ? "Message " + view + " privately" : "Message every session") + "… (⌘/Ctrl+Enter to send)";
-  renderSidebar();
-  renderLog();
+  const peer = peers.find(p => p.name === view);
+  $("title").textContent = dm ? "@ " + view : "# everyone";
+  $("topic").textContent = dm ? "Private · " + (peer && peer.summary || peer && peer.cwd || "")
+                              : "Sessions coordinating with each other";
+  $("body").placeholder = dm ? "Message @" + view : "Message #everyone";
+  renderSidebar(all);
+  renderLog(all);
 }
 
 function find(id) {
@@ -797,7 +905,7 @@ function jump(id) {
     const g = groups().find(g => g.rows.some(r => r.id === id));
     if (!g) return;
     const vs = viewsOf(g);
-    setView(vs.includes(CHANNEL) ? CHANNEL : vs[0]);
+    setView(vs.includes(view) ? view : vs.includes(CHANNEL) ? CHANNEL : vs[0]);
     t = find(id);
   }
   if (!t) return;
@@ -808,9 +916,10 @@ function jump(id) {
 
 function setView(v) {
   view = v;
-  history.replaceState(null, "", v === CHANNEL ? "#channel" : "#" + encodeURIComponent(v));
+  history.replaceState(null, "", v === CHANNEL ? "#everyone" : "#" + encodeURIComponent(v));
   render();
   $("log").scrollTop = $("log").scrollHeight;
+  $("body").focus();
 }
 
 async function poll() {
@@ -822,12 +931,17 @@ async function poll() {
     messages.push(...s.messages);
     if (s.messages.length) since = s.messages[s.messages.length - 1].id;
     unread = new Set(s.unread);
-    if (first && firstVisit) [CHANNEL, ...peers.map(p => p.name)].forEach(markRead);  // don't flag old history
+    if (first) {
+      notified = since;  // only notify about replies that arrive from now on
+      if (firstVisit) { const all = groups(); [CHANNEL, ...peers.map(p => p.name)].forEach(v => markRead(v, all)); }
+    } else {
+      notify();
+    }
     render();
     renderNotes(s.notes);
-    $("status").textContent = "live · " + peers.length + " sessions";
+    $("status").textContent = peers.length + " sessions";
   } catch (e) {
-    $("status").textContent = "disconnected (" + e.message + ")";
+    $("status").textContent = "offline";
   }
   setTimeout(poll, 1500);
 }
@@ -839,13 +953,21 @@ $("compose").onsubmit = async ev => {
   try {
     await api("/api/send", {to: view === CHANNEL ? "*" : view, body});
     $("body").value = "";
+    $("body").style.height = "";
   } catch (e) {
     alert("Send failed: " + e.message);
   }
 };
 $("body").onkeydown = ev => {
-  if (ev.key === "Enter" && (ev.metaKey || ev.ctrlKey)) $("compose").requestSubmit();
+  if (ev.key === "Enter" && !ev.shiftKey && !ev.isComposing) { ev.preventDefault(); $("compose").requestSubmit(); }
 };
+$("body").oninput = () => {
+  const t = $("body");
+  t.style.height = "";
+  t.style.height = t.scrollHeight + "px";
+};
+document.addEventListener("visibilitychange", () => { if (!document.hidden) render(); });
+renderNotify();
 poll();
 </script>
 </body>

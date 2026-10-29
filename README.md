@@ -18,9 +18,10 @@ of the change and report back. You watch, and join in, from one local page.
   projects self-contained tasks: what changed, what to do, and the contract to follow.
 - **Shared notes.** Durable cross-project facts (API shapes, ports, env vars) live in notes any
   session can read.
-- **A GUI for you.** `bridge.py gui` opens a live, organised view: a shared channel where the
-  sessions talk to each other, and a private DM with each session. Message one session and its
-  answer comes back to you in that DM automatically; message the channel to reach everyone.
+- **A chat-style GUI for you.** `bridge.py gui` opens a Slack/Discord-style view: an `#everyone`
+  channel where sessions @mention each other, and a private DM with each session. Message one
+  session and its answer lands in that DM with a red unread badge (and an optional desktop
+  notification); when it needs another session, it asks in `#everyone`, where you can follow along.
 - **Nothing to install but Python.** One file, standard library only, SQLite at
   `~/.claude-bridge`. Nothing leaves your machine.
 
@@ -75,4 +76,6 @@ to work on. See [SECURITY.md](SECURITY.md).
 
 ## License
 
-[MIT](LICENSE). By Cydraintel.
+Free for everyone: use it, change it, ship it, commercially or not. The only ask is credit:
+keep the copyright notice from [LICENSE](LICENSE) (MIT) with any copy, and a mention or link back
+to this repo is appreciated. Made by Cydraintel.
