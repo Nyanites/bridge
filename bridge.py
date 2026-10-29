@@ -12,12 +12,15 @@ Usage:
     bridge.py session-start    # SessionStart hook: tells Claude to start the listener
     bridge.py stop             # Stop hook: delivers late messages, keeps the listener alive
     bridge.py send TO MESSAGE  # send a message from the terminal (as "human")
+    bridge.py post TO MESSAGE [--image PATH]... [--reply-to ID]
+                               # send as this folder's session, with images (sessions can run it via Bash)
     bridge.py peers            # list known sessions
     bridge.py log [N]          # show the last N messages
     bridge.py gui [PORT]       # local web UI for messages across sessions (--no-open: don't launch a browser)
 """
 import json
 import os
+import runpy
 import shlex
 import shutil
 import sqlite3
@@ -332,7 +335,8 @@ endpoint, schema, version), a test run, or a review. Don't guess, stub it out or
 4. Attach images when they help. If a picture explains it better (a screenshot of the UI or the bug,
    an error dialog, rendered output, a diagram or mockup), save it as a PNG, JPG, GIF or WebP file and pass
    its path in `send`'s `attachments` (up to 5 images, 10 MB each). Still say in words what the image shows
-   and what to look at: the image adds context, it doesn't replace the written request.
+   and what to look at: the image adds context, it doesn't replace the written request. If your `send`
+   tool has no `attachments` option, run `{post} <to> "<message>" --image <path>` with Bash instead.
 5. If you can't continue without the answer, tell the user you're waiting on that session. Then use
    `wait` with reply_to = your message id, or carry on with other work and pick the reply up when it arrives.
 
@@ -370,13 +374,31 @@ INBOUND_HINT = (
 # --- MCP stdio server ----------------------------------------------------------
 
 def serve():
+    code = {"mtime": os.path.getmtime(__file__), "g": globals()}
     bridge = Bridge(os.getcwd())
+
+    def write(msg):
+        sys.stdout.write(json.dumps(msg) + "\n")
+        sys.stdout.flush()
 
     def reply(id_, result=None, error=None):
         msg = {"jsonrpc": "2.0", "id": id_}
         msg["error" if error else "result"] = error or result
-        sys.stdout.write(json.dumps(msg) + "\n")
-        sys.stdout.flush()
+        write(msg)
+
+    def current():
+        """Pick up edits to bridge.py without restarting the session, and tell Claude Code the tools changed."""
+        nonlocal bridge
+        mtime = os.path.getmtime(__file__)
+        if mtime != code["mtime"]:
+            code["mtime"] = mtime
+            try:
+                g = runpy.run_path(__file__)  # runs as a plain module, so it won't start serving
+                bridge, code["g"] = g["Bridge"](os.getcwd()), g
+                write({"jsonrpc": "2.0", "method": "notifications/tools/list_changed"})
+            except Exception:  # a half-saved or broken edit: keep serving the code we have
+                pass
+        return code["g"]
 
     for line in sys.stdin:
         if not line.strip():
@@ -389,25 +411,26 @@ def serve():
         method, id_, params = req.get("method"), req.get("id"), req.get("params") or {}
         if id_ is None:  # notification
             continue
+        g = current()
         if method == "initialize":
             reply(id_, {
                 "protocolVersion": params.get("protocolVersion", "2025-06-18"),
-                "capabilities": {"tools": {}},
+                "capabilities": {"tools": {"listChanged": True}},
                 "serverInfo": {"name": "bridge", "version": "0.1.0"},
-                "instructions": INSTRUCTIONS + f" You are peer '{bridge.me}'.",
+                "instructions": g["INSTRUCTIONS"] + f" You are peer '{bridge.me}'.",
             })
         elif method == "ping":
             reply(id_, {})
         elif method == "tools/list":
-            reply(id_, {"tools": [{"name": n, "description": d, "inputSchema": s} for n, d, s, _ in TOOLS]})
+            reply(id_, {"tools": [{"name": n, "description": d, "inputSchema": s} for n, d, s, _ in g["TOOLS"]]})
         elif method == "tools/call":
             name = params.get("name")
-            if name not in HANDLERS:
+            if name not in g["HANDLERS"]:
                 reply(id_, error={"code": -32602, "message": f"Unknown tool: {name}"})
                 continue
             try:
                 touch(bridge.db, bridge.me)
-                text, is_error = HANDLERS[name](bridge, params.get("arguments") or {}), False
+                text, is_error = g["HANDLERS"][name](bridge, params.get("arguments") or {}), False
             except Exception as e:  # report tool failures to the model rather than crashing
                 text, is_error = f"Error: {e}", True
             reply(id_, {"content": [{"type": "text", "text": text}], "isError": is_error})
@@ -481,7 +504,7 @@ def session_start():
         "No other sessions have connected yet; check `peers` when you need one."
     mine = next(r for r in rows if r["name"] == me)
     print(BRIDGE_RULES.format(
-        me=me, cwd=mine["cwd"], roster=roster, listen=LISTEN_CMD,
+        me=me, cwd=mine["cwd"], roster=roster, listen=LISTEN_CMD, post=LISTEN_CMD.rsplit(" ", 1)[0] + " post",
         describe="" if mine["summary"] else
         "This project has no Bridge description yet: set a one-line one with the `describe` tool.",
     ))
@@ -1233,6 +1256,18 @@ def cli(argv):
         db = connect()
         for r in db.execute("SELECT * FROM peers ORDER BY last_seen DESC"):
             print(f"{r['name']:20} {ago(r['last_seen']):>9}  {r['cwd']}  {r['summary']}")
+    elif cmd == "post":
+        import argparse
+        p = argparse.ArgumentParser(prog="bridge.py post", description="Send as the session that owns this folder.")
+        p.add_argument("to", help="peer name, or '*' for every session")
+        p.add_argument("message")
+        p.add_argument("--image", action="append", default=[], help="image to attach (repeatable)")
+        p.add_argument("--reply-to", type=int)
+        a = p.parse_args(argv[1:])
+        try:
+            print(Bridge(os.getcwd()).send(a.to, a.message, a.reply_to, a.image))
+        except ValueError as e:
+            sys.exit(f"Error: {e}")
     elif cmd == "send" and len(argv) >= 3:
         db = connect()
         db.execute(

@@ -21,7 +21,8 @@ for event, sub in (("SessionStart", "session-start"), ("UserPromptSubmit", "hook
 allow = settings.setdefault("permissions", {}).setdefault("allow", [])
 allow[:] = [r for r in allow if "bridge.py" not in r]
 # Read(...) lets sessions open images other sessions attach without a permission prompt
-for rule in ("mcp__bridge", f"Bash(python3 {shlex.quote(bridge)} listen)", "Read(~/.claude-bridge/files/**)"):
+for rule in ("mcp__bridge", f"Bash(python3 {shlex.quote(bridge)} listen)", f"Bash(python3 {shlex.quote(bridge)} post:*)",
+             "Read(~/.claude-bridge/files/**)"):
     if rule not in allow:
         allow.append(rule)
 json.dump(settings, open(path, "w"), indent=2)
