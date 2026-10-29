@@ -353,8 +353,10 @@ Don't reply to pure acknowledgements or reports that need nothing from you, so c
 These come from the Bridge GUI, either privately to you or in #everyone. Answer in your normal response;
 it is relayed back to where they wrote. Don't `send` to human. If another session needs to act, ask it as above.
 
-## Everything you send is public
+## Everything you send is public, and replies are threaded
 Messages between sessions are posted in #everyone, so write them for both the receiving session and the user.
+A message sent with reply_to goes into the thread of the post it answers, so always pass reply_to when you
+answer or follow up on something; leave it out only to start a new topic.
 
 ## Keep the listener running
 Before anything else, start the Bridge listener: run `{listen}` with the Bash tool and
@@ -689,7 +691,8 @@ def gui(port=8765, open_browser=True):
                 data = json.loads(self.rfile.read(int(self.headers.get("Content-Length") or 0)))
                 to = data.get("to", "")
                 to = [str(t) for t in to] if isinstance(to, list) else str(to)
-                ids = gui_send(to, str(data.get("body", "")), data.get("reply_to") or None, bool(data.get("channel")))
+                reply_to = int(data["reply_to"]) if data.get("reply_to") else None
+                ids = gui_send(to, str(data.get("body", "")), reply_to, bool(data.get("channel")))
             except (ValueError, TypeError) as e:
                 return self.respond(400, {"error": str(e)})
             self.respond(200, {"ids": ids})
@@ -767,13 +770,33 @@ details pre { white-space: pre-wrap; margin: 4px 0 8px; color: var(--muted); fon
   color: #fff; font-weight: 600; cursor: pointer; }
 
 /* main */
-main { flex: 1; display: flex; flex-direction: column; min-width: 0; }
+main { flex: 1; display: flex; min-width: 0; }
+.chat { flex: 1; display: flex; flex-direction: column; min-width: 0; }
+#thread { width: 420px; flex: none; display: flex; flex-direction: column; border-left: 1px solid var(--line); min-width: 0; }
+#thread[hidden] { display: none; }
+#thread .x { margin-left: auto; border: 0; background: none; color: var(--muted); font-size: 24px; line-height: 1;
+  cursor: pointer; padding: 0 4px; }
+#thread .x:hover { color: var(--strong); }
+.tdiv { display: flex; align-items: center; gap: 8px; padding: 8px 16px 0; color: var(--muted); font-size: 13px; }
+.tdiv::after { content: ""; flex: 1; border-top: 1px solid var(--line); }
+.thread-sum { display: flex; align-items: center; gap: 6px; width: fit-content; margin-top: 4px; padding: 3px 8px 3px 4px;
+  border-radius: 6px; border: 1px solid transparent; cursor: pointer; font-size: 13px; }
+.thread-sum:hover, .thread-sum.open { background: var(--main); border-color: var(--line); }
+.thread-sum .avatar { width: 20px; height: 20px; font-size: 10px; border-radius: 5px; }
+.thread-sum .count { color: var(--mention-text); font-weight: 700; }
+.thread-sum .new { background: var(--red); color: #fff; border-radius: 9px; padding: 0 6px; font-size: 11px; font-weight: 700; }
+.thread-sum .last { color: var(--muted); }
+.msg { position: relative; }
+.msg .act { position: absolute; right: 16px; top: -14px; display: none; border: 1px solid var(--line); border-radius: 6px;
+  background: var(--main); color: var(--text); font-size: 13px; padding: 3px 8px; cursor: pointer; z-index: 1; }
+.msg:hover .act { display: block; }
+.msg .act:hover { background: var(--sel); }
 header { height: 52px; flex: none; display: flex; align-items: center; gap: 10px; padding: 0 16px;
   border-bottom: 1px solid var(--line); }
 header .title { font-weight: 700; color: var(--strong); white-space: nowrap; }
 header .topic { color: var(--muted); font-size: 14px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
   padding-left: 10px; border-left: 1px solid var(--line); }
-#log { flex: 1; overflow-y: auto; padding: 16px 0 8px; }
+.log { flex: 1; overflow-y: auto; padding: 16px 0 8px; }
 .intro { padding: 16px 16px 20px; }
 .intro .big { width: 64px; height: 64px; border-radius: 50%; display: grid; place-items: center; font-size: 30px;
   background: var(--sel); color: var(--strong); margin-bottom: 8px; }
@@ -818,7 +841,8 @@ form { padding: 0 16px 20px; position: relative; }
 textarea { flex: 1; border: 0; outline: 0; resize: none; background: transparent; color: var(--text); font: inherit;
   padding: 11px 0; max-height: 40vh; height: 44px; }
 .hint { font-size: 12px; color: var(--muted); padding: 4px 2px 0; }
-@media (max-width: 700px) { body { flex-direction: column; } aside { width: auto; max-height: 40vh; } }
+@media (max-width: 700px) { body { flex-direction: column; } aside { width: auto; max-height: 40vh; }
+  #thread { position: fixed; inset: 0; width: auto; background: var(--main); z-index: 5; } }
 </style>
 </head>
 <body>
@@ -835,24 +859,40 @@ textarea { flex: 1; border: 0; outline: 0; resize: none; background: transparent
   <div id="notify"></div>
 </aside>
 <main>
-  <header><span class="title" id="title"></span><span class="topic" id="topic"></span></header>
-  <div id="log"></div>
-  <form id="compose">
-    <div class="mentions" id="mentions" hidden></div>
-    <div class="box"><textarea id="body" rows="1"></textarea></div>
-    <div class="hint" id="hint"></div>
-  </form>
+  <div class="chat">
+    <header><span class="title" id="title"></span><span class="topic" id="topic"></span></header>
+    <div class="log" id="log"></div>
+    <form id="compose">
+      <div class="mentions" hidden></div>
+      <div class="box"><textarea rows="1"></textarea></div>
+      <div class="hint"></div>
+    </form>
+  </div>
+  <section id="thread" hidden>
+    <header><span class="title">Thread</span><span class="topic"># everyone</span>
+      <button type="button" class="x" id="close-thread" title="Close thread">×</button></header>
+    <div class="log" id="tlog"></div>
+    <form id="tcompose">
+      <div class="mentions" hidden></div>
+      <div class="box"><textarea rows="1" placeholder="Reply in thread…"></textarea></div>
+      <div class="hint"></div>
+    </form>
+  </section>
 </main>
 <script>
 const TOKEN = "__TOKEN__";
 const CHANNEL = "#everyone";
 const $ = id => document.getElementById(id);
-const fromHash = decodeURIComponent(location.hash.slice(1));
-let since = 0, view = fromHash && fromHash !== "everyone" ? fromHash : CHANNEL, peers = [], messages = [];
+let since = 0, view = CHANNEL, thread = null, peers = [], messages = [];
 let unread = new Set(), skew = 0, notified = 0;
-let lastRead = {};  // view -> highest message id seen there (this browser only)
+let lastRead = {};  // view or "t<thread root id>" -> highest message id seen there (this browser only)
 try { lastRead = JSON.parse(localStorage.getItem("bridge.lastRead")) || {}; } catch (e) {}
 const firstVisit = !Object.keys(lastRead).length;
+{
+  const h = decodeURIComponent(location.hash.slice(1));
+  if (h && !h.startsWith("everyone")) view = h;
+  else if (h.startsWith("everyone/")) thread = parseInt(h.split("/")[1], 10) || null;
+}
 
 function el(tag, cls, text) {
   const e = document.createElement(tag);
@@ -899,6 +939,7 @@ async function api(path, body) {
   if (!r.ok) throw new Error(data.error || r.status);
   return data;
 }
+function save() { try { localStorage.setItem("bridge.lastRead", JSON.stringify(lastRead)); } catch (e) {} }
 
 // A message to several recipients is stored as one row each; fold those back into one post.
 function groups() {
@@ -913,7 +954,11 @@ function groups() {
                 attachments: m.attachments || [], rows: [m]});
     }
   }
-  for (const g of out) g.everyone = g.rows.length > 1;
+  for (const g of out) {
+    g.everyone = g.rows.length > 1;
+    g.key = g.rows[0].id;
+    g.maxId = Math.max(...g.rows.map(r => r.id));
+  }
   return out;
 }
 // Sessions talk in #everyone, addressed with @mentions; so do you when you post there, and their answers
@@ -923,18 +968,47 @@ function viewsOf(g) {
   if (!withHuman || g.channel || g.sender === "human" && g.everyone) return [CHANNEL];
   return [g.sender === "human" ? g.rows[0].recipient : g.sender];
 }
-function itemsFor(v, all = groups()) {
-  return all.filter(g => viewsOf(g).includes(v));
+// Everything rendering needs, computed once per render. In #everyone a reply (reply_to) belongs to the
+// thread of the top-level post it ultimately answers.
+function model() {
+  const all = groups();
+  const byRow = new Map();
+  for (const g of all) for (const r of g.rows) byRow.set(r.id, g);
+  const inChannel = g => viewsOf(g).includes(CHANNEL);
+  const rootOf = g => {
+    let cur = g;
+    for (let hops = 0; cur.reply_to && hops < 1000; hops++) {
+      const parent = byRow.get(cur.reply_to);
+      if (!parent || !inChannel(parent)) break;
+      cur = parent;
+    }
+    return cur;
+  };
+  const roots = [], threads = new Map();
+  for (const g of all.filter(inChannel)) {
+    const root = rootOf(g);
+    if (root === g) roots.push(g);
+    else (threads.get(root.key) || threads.set(root.key, []).get(root.key)).push(g);
+  }
+  return {all, byRow, roots, threads, rootOf, inChannel};
 }
-function unreadCount(v, all) {
-  const seen = lastRead[v] || 0;
-  return itemsFor(v, all).filter(g => g.sender !== "human" && Math.max(...g.rows.map(r => r.id)) > seen).length;
+const threadSeen = key => lastRead["t" + key] ?? lastRead.base ?? 0;
+const fresh = (g, seen) => g.sender !== "human" && g.maxId > seen;
+function dmItems(M, v) { return M.all.filter(g => viewsOf(g)[0] === v && v !== CHANNEL); }
+function unreadDM(M, v) { return dmItems(M, v).filter(g => fresh(g, lastRead[v] || 0)).length; }
+function unreadThread(M, key) { return (M.threads.get(key) || []).filter(g => fresh(g, threadSeen(key))).length; }
+function unreadChannel(M) {
+  let n = M.roots.filter(g => fresh(g, lastRead[CHANNEL] || 0)).length;
+  for (const key of M.threads.keys()) n += unreadThread(M, key);
+  return n;
 }
-function markRead(v, all) {
-  const ids = itemsFor(v, all).flatMap(g => g.rows.map(r => r.id));
-  if (!ids.length) return;
-  lastRead[v] = Math.max(lastRead[v] || 0, ...ids);
-  try { localStorage.setItem("bridge.lastRead", JSON.stringify(lastRead)); } catch (e) {}
+function markRead(M) {
+  if (document.hidden) return;
+  const top = view === CHANNEL ? M.roots : dmItems(M, view);
+  if (top.length) lastRead[view] = Math.max(lastRead[view] || 0, ...top.map(g => g.maxId));
+  const reps = thread && M.threads.get(thread);
+  if (reps && reps.length) lastRead["t" + thread] = Math.max(threadSeen(thread), ...reps.map(g => g.maxId));
+  save();
 }
 
 const MENTION = /@([\w-]+(?:\.[\w-]+)*)/g;
@@ -975,12 +1049,12 @@ function sidebarItem(v, icon, label, sub, count) {
   return d;
 }
 
-function renderSidebar(all) {
-  const chCount = view === CHANNEL ? 0 : unreadCount(CHANNEL, all);
+function renderSidebar(M) {
+  const chCount = unreadChannel(M);
   $("channels").replaceChildren(sidebarItem(CHANNEL, el("span", "hash", "#"), "everyone", null, chCount));
   let replies = 0;
   $("dms").replaceChildren(...peers.map(p => {
-    const n = view === p.name ? 0 : unreadCount(p.name, all);
+    const n = view === p.name ? 0 : unreadDM(M, p.name);
     replies += n;
     const sub = (p.listening ? "listening" : "not listening") + (p.summary ? " · " + p.summary : "");
     const item = sidebarItem(p.name, avatar(p.name, p), p.name, sub, n);
@@ -1014,12 +1088,86 @@ function renderNotify() {
   box.append(d);
 }
 
-function renderLog(all) {
-  const log = $("log");
-  const atBottom = log.scrollHeight - log.scrollTop - log.clientHeight < 60;
+// One message. opts: {M, log, stick, cont, chips, preview, threadKey (adds the thread summary and action)}
+function messageEl(g, opts) {
+  const d = el("div", "msg" + (opts.cont ? " cont" : ""));
+  d.dataset.ids = " " + g.rows.map(r => r.id).join(" ") + " ";
+  const ref = opts.preview && g.reply_to && opts.M.byRow.get(g.reply_to);
+  if (ref) {
+    const r = el("div", "reply");
+    r.append(el("b", null, display(ref.sender)), el("span", null, ref.body.replace(/\s+/g, " ")));
+    r.onclick = () => jump(g.reply_to);
+    d.append(r);
+  }
+  d.append(avatar(g.sender));
+  const c = el("div", "content");
+  if (!opts.cont) {
+    const meta = el("div", "meta");
+    const t = el("span", "time", when(g.created));
+    t.title = new Date(g.created * 1000).toLocaleString();
+    meta.append(el("span", "name", display(g.sender)), t);
+    c.append(meta);
+  }
+  const text = el("div", "text");
+  for (const t of opts.chips ? targets(g) : []) text.append(el("span", "mention", "@" + t), " ");
+  text.append(...withMentions(g.body));
+  c.append(text);
+  if (g.attachments.length) {
+    const atts = el("div", "atts");
+    for (const name of g.attachments) {
+      const url = "/files/" + encodeURIComponent(name) + "?t=" + encodeURIComponent(TOKEN);
+      const a = el("a");
+      a.href = url;
+      a.target = "_blank";
+      const img = el("img");
+      img.src = url;
+      img.alt = name.replace(/^[0-9a-f]{12}-/, "");
+      img.title = img.alt;
+      img.onload = () => { if (opts.stick) opts.log.scrollTop = opts.log.scrollHeight; };
+      a.append(img);
+      atts.append(a);
+    }
+    c.append(atts);
+  }
+  const waiting = g.rows.filter(r => unread.has(r.id) && r.recipient !== "human").map(r => r.recipient);
+  if (waiting.length) c.append(el("div", "state", "⏳ Waiting for " + waiting.join(", ") + " to pick this up"));
+  if (opts.threadKey) {
+    const reps = opts.M.threads.get(opts.threadKey) || [];
+    if (reps.length) {
+      const sum = el("div", "thread-sum" + (thread === opts.threadKey ? " open" : ""));
+      const who = [...new Set(reps.map(r => r.sender))].slice(0, 4);
+      sum.append(...who.map(n => avatar(n)), el("span", "count", reps.length + (reps.length === 1 ? " reply" : " replies")));
+      const n = unreadThread(opts.M, opts.threadKey);
+      if (n && thread !== opts.threadKey) sum.append(el("span", "new", n + " new"));
+      sum.append(el("span", "last", "Last reply " + ago(reps[reps.length - 1].created)));
+      sum.onclick = () => openThread(opts.threadKey);
+      c.append(sum);
+    }
+    const act = el("button", "act", "💬 Reply in thread");
+    act.type = "button";
+    act.onclick = () => openThread(opts.threadKey);
+    d.append(act);
+  }
+  d.append(c);
+  return d;
+}
+
+function renderList(log, items, opts, intro) {
+  const stick = log.scrollHeight - log.scrollTop - log.clientHeight < 60;
+  log.replaceChildren(...(intro ? [intro] : []));
+  let prev = null;
+  for (const g of items) {
+    const cont = !opts.noGrouping && prev && prev.sender === g.sender && !(opts.preview && g.reply_to)
+                 && g.created - prev.created < 300 && !(opts.M.threads.get(prev.key) || []).length && opts.view !== CHANNEL;
+    log.append(messageEl(g, {...opts, log, stick, cont, threadKey: opts.view === CHANNEL ? g.key : null}));
+    prev = g;
+  }
+  if (stick) log.scrollTop = log.scrollHeight;
+}
+
+function renderMain(M) {
   const dm = view !== CHANNEL;
   const peer = peers.find(p => p.name === view);
-  log.replaceChildren();
   const intro = el("div", "intro");
   if (dm) {
     const a = avatar(view, peer);
@@ -1029,113 +1177,109 @@ function renderLog(all) {
                                + ". Its answers to you land here. When it needs another session, it asks in #everyone."));
   } else {
     intro.append(el("div", "big", "#"), el("h2", null, "Welcome to #everyone"),
-                 el("p", null, "Where the sessions talk to each other. @mention a session to ask just it, and its answer comes back here. A post without a mention reaches every session."));
+                 el("p", null, "Where the sessions talk to each other. @mention a session to ask just it. Replies collect in a thread under the post they answer."));
   }
-  log.append(intro);
-  const byId = new Map(messages.map(m => [m.id, m]));
-  let prev = null;
-  for (const g of itemsFor(view, all)) {
-    const cont = prev && prev.sender === g.sender && !g.reply_to && g.created - prev.created < 300;
-    const d = el("div", "msg" + (cont ? " cont" : ""));
-    d.dataset.ids = " " + g.rows.map(r => r.id).join(" ") + " ";
-    const ref = g.reply_to && byId.get(g.reply_to);
-    if (ref) {
-      const r = el("div", "reply");
-      r.append(el("b", null, display(ref.sender)), el("span", null, ref.body.replace(/\s+/g, " ")));
-      r.onclick = () => jump(g.reply_to);
-      d.append(r);
-    }
-    d.append(avatar(g.sender));
-    const c = el("div", "content");
-    if (!cont) {
-      const meta = el("div", "meta");
-      const t = el("span", "time", when(g.created));
-      t.title = new Date(g.created * 1000).toLocaleString();
-      meta.append(el("span", "name", display(g.sender)), t);
-      c.append(meta);
-    }
-    const text = el("div", "text");
-    for (const t of dm ? [] : targets(g)) text.append(el("span", "mention", "@" + t), " ");
-    text.append(...withMentions(g.body));
-    c.append(text);
-    if (g.attachments.length) {
-      const atts = el("div", "atts");
-      for (const name of g.attachments) {
-        const url = "/files/" + encodeURIComponent(name) + "?t=" + encodeURIComponent(TOKEN);
-        const a = el("a");
-        a.href = url;
-        a.target = "_blank";
-        const img = el("img");
-        img.src = url;
-        img.alt = name.replace(/^[0-9a-f]{12}-/, "");
-        img.title = img.alt;
-        img.onload = () => { if (atBottom) log.scrollTop = log.scrollHeight; };
-        a.append(img);
-        atts.append(a);
-      }
-      c.append(atts);
-    }
-    const waiting = g.rows.filter(r => unread.has(r.id) && r.recipient !== "human").map(r => r.recipient);
-    if (waiting.length) c.append(el("div", "state", "⏳ Waiting for " + waiting.join(", ") + " to pick this up"));
-    d.append(c);
-    log.append(d);
-    prev = g;
-  }
-  if (atBottom) log.scrollTop = log.scrollHeight;
+  renderList($("log"), dm ? dmItems(M, view) : M.roots, {M, view, chips: !dm, preview: true}, intro);
 }
 
-function notify(all) {
-  // desktop notification for new replies to you, unless you're already looking at that DM
+function renderThread(M) {
+  const panel = $("thread");
+  const root = thread && M.roots.find(g => g.key === thread);
+  if (!root || view !== CHANNEL) { panel.hidden = true; thread = null; return; }
+  panel.hidden = false;
+  const log = $("tlog");
+  const reps = M.threads.get(thread) || [];
+  const stick = log.scrollHeight - log.scrollTop - log.clientHeight < 60;
+  log.replaceChildren(messageEl(root, {M, log, stick, chips: true}),
+                      el("div", "tdiv", reps.length ? reps.length + (reps.length === 1 ? " reply" : " replies") : "No replies yet"));
+  let prev = null;
+  for (const g of reps) {
+    const cont = prev && prev.sender === g.sender && g.created - prev.created < 300;
+    log.append(messageEl(g, {M, log, stick, cont, chips: true}));
+    prev = g;
+  }
+  if (stick) log.scrollTop = log.scrollHeight;
+  const who = threadPeople(M, root);
+  $("tcompose").querySelector(".hint").textContent =
+    (who.length ? "Goes to " + who.join(", ") : "Goes to every session") + " · @mention to ask someone else · Enter to send";
+}
+// sessions taking part in a thread; your thread replies go to them
+function threadPeople(M, root) {
+  const names = new Set(peers.map(p => p.name)), who = new Set();
+  for (const g of [root, ...(M.threads.get(root.key) || [])])
+    for (const r of g.rows) for (const n of [r.sender, r.recipient]) if (names.has(n)) who.add(n);
+  return [...who];
+}
+
+function notify(M) {
+  // desktop notification for new replies to you, unless you're already looking at them
   const fresh = messages.filter(m => m.recipient === "human" && m.id > notified);
   if (fresh.length) notified = fresh[fresh.length - 1].id;
   if (!("Notification" in window) || Notification.permission !== "granted") return;
   for (const m of fresh) {
-    const where = m.channel ? CHANNEL : m.sender;
-    if (!document.hidden && view === where) continue;
+    const g = M.byRow.get(m.id), root = g && M.inChannel(g) ? M.rootOf(g) : null;
+    const where = m.channel ? CHANNEL : m.sender, inThread = root && root !== g ? root.key : null;
+    if (!document.hidden && view === where && (!inThread || thread === inThread)) continue;
     const n = new Notification(m.sender + " replied" + (m.channel ? " in #everyone" : ""), {body: m.body.slice(0, 200), tag: "bridge-" + m.id});
-    n.onclick = () => { window.focus(); setView(where); n.close(); };
+    n.onclick = () => { window.focus(); setView(where); if (inThread) openThread(inThread); n.close(); };
   }
 }
 
 function render() {
   if (view !== CHANNEL && !peers.some(p => p.name === view)) view = CHANNEL;
-  const all = groups();
-  if (!document.hidden) markRead(view, all);
+  const M = model();
+  markRead(M);
   const dm = view !== CHANNEL;
   const peer = peers.find(p => p.name === view);
   $("title").textContent = dm ? "@ " + view : "# everyone";
   $("topic").textContent = dm ? "Private · " + (peer && peer.summary || peer && peer.cwd || "")
                               : "Sessions coordinating with each other";
-  $("body").placeholder = dm ? "Message @" + view : "Message #everyone · type @ to mention a session";
-  $("hint").textContent = (dm ? "Only " + view + " sees this · " : "@mention sessions to ask just them · ") + "Enter to send · Shift+Enter for a new line";
-  renderSidebar(all);
-  renderLog(all);
+  main.input.placeholder = dm ? "Message @" + view : "Message #everyone · type @ to mention a session";
+  $("compose").querySelector(".hint").textContent =
+    (dm ? "Only " + view + " sees this · " : "@mention sessions to ask just them · ") + "Enter to send · Shift+Enter for a new line";
+  renderSidebar(M);
+  renderMain(M);
+  renderThread(M);
 }
 
-function find(id) {
-  return [...$("log").children].find(c => c.dataset.ids && c.dataset.ids.includes(" " + id + " "));
+function setHash() {
+  history.replaceState(null, "", view !== CHANNEL ? "#" + encodeURIComponent(view) : thread ? "#everyone/" + thread : "#everyone");
+}
+function setView(v) {
+  view = v;
+  if (v !== CHANNEL) thread = null;
+  setHash();
+  render();
+  $("log").scrollTop = $("log").scrollHeight;
+  main.input.focus();
+}
+function openThread(key) {
+  view = CHANNEL;
+  thread = key;
+  setHash();
+  render();
+  $("tlog").scrollTop = $("tlog").scrollHeight;
+  side.input.focus();
+}
+$("close-thread").onclick = () => { thread = null; setHash(); render(); };
+
+function find(log, id) {
+  return [...log.children].find(c => c.dataset.ids && c.dataset.ids.includes(" " + id + " "));
 }
 function jump(id) {
-  let t = find(id);
-  if (!t) {
-    const g = groups().find(g => g.rows.some(r => r.id === id));
-    if (!g) return;
-    const vs = viewsOf(g);
-    setView(vs.includes(view) ? view : vs.includes(CHANNEL) ? CHANNEL : vs[0]);
-    t = find(id);
-  }
+  const M = model(), g = M.byRow.get(id);
+  if (!g) return;
+  let log = $("log");
+  if (M.inChannel(g)) {
+    const root = M.rootOf(g);
+    if (root !== g) { openThread(root.key); log = $("tlog"); }
+    else if (view !== CHANNEL) setView(CHANNEL);
+  } else if (view !== viewsOf(g)[0]) setView(viewsOf(g)[0]);
+  const t = find(log, id) || find($("tlog"), id);
   if (!t) return;
   t.scrollIntoView({behavior: "smooth", block: "center"});
   t.classList.add("flash");
   setTimeout(() => t.classList.remove("flash"), 1200);
-}
-
-function setView(v) {
-  view = v;
-  history.replaceState(null, "", v === CHANNEL ? "#everyone" : "#" + encodeURIComponent(v));
-  render();
-  $("log").scrollTop = $("log").scrollHeight;
-  $("body").focus();
 }
 
 async function poll() {
@@ -1149,9 +1293,14 @@ async function poll() {
     unread = new Set(s.unread);
     if (first) {
       notified = since;  // only notify about replies that arrive from now on
-      if (firstVisit) { const all = groups(); [CHANNEL, ...peers.map(p => p.name)].forEach(v => markRead(v, all)); }
+      if (lastRead.base == null) lastRead.base = since;  // don't flag history from before this browser looked
+      if (firstVisit) {
+        lastRead[CHANNEL] = since;
+        for (const p of peers) lastRead[p.name] = since;
+      }
+      save();
     } else {
-      notify();
+      notify(model());
     }
     render();
     renderNotes(s.notes);
@@ -1162,75 +1311,83 @@ async function poll() {
   setTimeout(poll, 1500);
 }
 
-$("compose").onsubmit = async ev => {
-  ev.preventDefault();
-  const body = $("body").value;
-  if (!body.trim()) return;
-  try {
-    let payload = {to: view, body};
-    if (view === CHANNEL) {
-      const tagged = mentionsIn(body);
-      payload = {to: !tagged.length || tagged.includes("everyone") ? "*" : tagged, body, channel: true};
-    }
-    await api("/api/send", payload);
-    closeMenu();
-    $("body").value = "";
-    $("body").style.height = "";
-  } catch (e) {
-    alert("Send failed: " + e.message);
+// A send box with the @mention picker. payload(body) says who it goes to.
+function composer(form, payload, canMention) {
+  const input = form.querySelector("textarea"), box = form.querySelector(".mentions");
+  let menu = {items: [], index: 0, start: 0};
+  const close = () => { box.hidden = true; menu.items = []; };
+  function update() {
+    const before = input.value.slice(0, input.selectionStart);
+    const m = canMention() && before.match(/(^|\s)@([\w.-]*)$/);
+    if (!m) return close();
+    const q = m[2].toLowerCase();
+    const opts = [...peers.map(p => ({name: p.name, sub: p.summary || p.cwd})), {name: "everyone", sub: "every session"}]
+      .filter(o => o.name.toLowerCase().startsWith(q));
+    if (!opts.length) return close();
+    menu = {items: opts, index: Math.min(menu.index, opts.length - 1), start: before.length - m[2].length - 1};
+    box.replaceChildren(el("div", "head", "Mention a session"));
+    opts.forEach((o, i) => {
+      const d = el("div", "mopt" + (i === menu.index ? " on" : ""));
+      d.append(o.name === "everyone" ? el("span", "hash", "@") : avatar(o.name), el("b", null, o.name), el("span", "sub", o.sub));
+      d.onmousedown = ev => { ev.preventDefault(); pick(i); };
+      box.append(d);
+    });
+    box.hidden = false;
   }
-};
-// @mention picker
-let menu = {items: [], index: 0, start: 0};
-function closeMenu() { $("mentions").hidden = true; menu.items = []; }
-function updateMenu() {
-  const t = $("body");
-  const before = t.value.slice(0, t.selectionStart);
-  const m = view === CHANNEL && before.match(/(^|\s)@([\w.-]*)$/);
-  if (!m) return closeMenu();
-  const q = m[2].toLowerCase();
-  const opts = [...peers.map(p => ({name: p.name, sub: p.summary || p.cwd})), {name: "everyone", sub: "every session"}]
-    .filter(o => o.name.toLowerCase().startsWith(q));
-  if (!opts.length) return closeMenu();
-  menu = {items: opts, index: Math.min(menu.index, opts.length - 1), start: before.length - m[2].length - 1};
-  const box = $("mentions");
-  box.replaceChildren(el("div", "head", "Mention a session"));
-  opts.forEach((o, i) => {
-    const d = el("div", "mopt" + (i === menu.index ? " on" : ""));
-    d.append(o.name === "everyone" ? el("span", "hash", "@") : avatar(o.name), el("b", null, o.name), el("span", "sub", o.sub));
-    d.onmousedown = ev => { ev.preventDefault(); pick(i); };
-    box.append(d);
-  });
-  box.hidden = false;
-}
-function pick(i) {
-  const t = $("body"), o = menu.items[i];
-  const after = t.value.slice(t.selectionStart);
-  t.value = t.value.slice(0, menu.start) + "@" + o.name + " " + after;
-  t.selectionStart = t.selectionEnd = menu.start + o.name.length + 2;
-  closeMenu();
-  t.focus();
-}
-$("body").onkeydown = ev => {
-  if (menu.items.length) {
-    if (ev.key === "ArrowDown" || ev.key === "ArrowUp") {
-      ev.preventDefault();
-      menu.index = (menu.index + (ev.key === "ArrowDown" ? 1 : menu.items.length - 1)) % menu.items.length;
-      return updateMenu();
-    }
-    if (ev.key === "Enter" || ev.key === "Tab") { ev.preventDefault(); return pick(menu.index); }
-    if (ev.key === "Escape") return closeMenu();
+  function pick(i) {
+    const o = menu.items[i], after = input.value.slice(input.selectionStart);
+    input.value = input.value.slice(0, menu.start) + "@" + o.name + " " + after;
+    input.selectionStart = input.selectionEnd = menu.start + o.name.length + 2;
+    close();
+    input.focus();
   }
-  if (ev.key === "Enter" && !ev.shiftKey && !ev.isComposing) { ev.preventDefault(); $("compose").requestSubmit(); }
-};
-$("body").oninput = () => {
-  const t = $("body");
-  t.style.height = "";
-  t.style.height = t.scrollHeight + "px";
-  menu.index = 0;
-  updateMenu();
-};
-$("body").onblur = closeMenu;
+  input.onkeydown = ev => {
+    if (menu.items.length) {
+      if (ev.key === "ArrowDown" || ev.key === "ArrowUp") {
+        ev.preventDefault();
+        menu.index = (menu.index + (ev.key === "ArrowDown" ? 1 : menu.items.length - 1)) % menu.items.length;
+        return update();
+      }
+      if (ev.key === "Enter" || ev.key === "Tab") { ev.preventDefault(); return pick(menu.index); }
+      if (ev.key === "Escape") return close();
+    }
+    if (ev.key === "Enter" && !ev.shiftKey && !ev.isComposing) { ev.preventDefault(); form.requestSubmit(); }
+  };
+  input.oninput = () => {
+    input.style.height = "";
+    input.style.height = input.scrollHeight + "px";
+    menu.index = 0;
+    update();
+  };
+  input.onblur = close;
+  form.onsubmit = async ev => {
+    ev.preventDefault();
+    const body = input.value;
+    if (!body.trim()) return;
+    try {
+      await api("/api/send", payload(body));
+      close();
+      input.value = "";
+      input.style.height = "";
+    } catch (e) {
+      alert("Send failed: " + e.message);
+    }
+  };
+  return {input};
+}
+const main = composer($("compose"), body => {
+  if (view !== CHANNEL) return {to: view, body};
+  const tagged = mentionsIn(body);
+  return {to: !tagged.length || tagged.includes("everyone") ? "*" : tagged, body, channel: true};
+}, () => view === CHANNEL);
+const side = composer($("tcompose"), body => {
+  const M = model(), root = M.roots.find(g => g.key === thread);
+  const reps = M.threads.get(thread) || [], last = reps.length ? reps[reps.length - 1] : root;
+  const tagged = mentionsIn(body), who = threadPeople(M, root);
+  const to = tagged.includes("everyone") ? "*" : tagged.length ? tagged : who.length ? who : "*";
+  return {to, body, channel: true, reply_to: last.rows[0].id};
+}, () => true);
+
 document.addEventListener("visibilitychange", () => { if (!document.hidden) render(); });
 renderNotify();
 poll();
