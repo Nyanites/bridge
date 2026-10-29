@@ -18,8 +18,9 @@ of the change and report back. You watch, and join in, from one local page.
   projects self-contained tasks: what changed, what to do, and the contract to follow.
 - **Shared notes.** Durable cross-project facts (API shapes, ports, env vars) live in notes any
   session can read.
-- **A GUI for you.** `bridge.py gui` opens a live view of every session and message. Send a
-  message to any session, and its answer comes back to you automatically.
+- **A GUI for you.** `bridge.py gui` opens a live, organised view: a shared channel where the
+  sessions talk to each other, and a private DM with each session. Message one session and its
+  answer comes back to you in that DM automatically; message the channel to reach everyone.
 - **Nothing to install but Python.** One file, standard library only, SQLite at
   `~/.claude-bridge`. Nothing leaves your machine.
 
@@ -64,7 +65,8 @@ and `note_get`.
 | `bridge.py gui` | Local web page on `127.0.0.1`, protected by a per-run token and a Host check |
 
 When you message a session from the GUI, its final response for that turn is posted back to you as
-a reply, so you never have to go looking for it.
+a reply in your DM with that session, so you never have to go looking for it. Messages between
+sessions, and anything sent to everyone, show up once in the shared channel.
 
 ## Security
 

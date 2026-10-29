@@ -154,11 +154,11 @@ class Bridge:
             recipients = [r["name"] for r in self.db.execute("SELECT name FROM peers WHERE name != ?", (self.me,))]
         elif to != "human" and not self.db.execute("SELECT 1 FROM peers WHERE name = ?", (to,)).fetchone():
             return f"Unknown peer '{to}'. Known peers:\n{self.peers()}"
-        ids = []
+        ids, now = [], time.time()  # one timestamp, so the GUI can show a broadcast once
         for r in recipients:
             cur = self.db.execute(
                 "INSERT INTO messages (sender, recipient, body, reply_to, created) VALUES (?, ?, ?, ?, ?)",
-                (self.me, r, message, reply_to, time.time()),
+                (self.me, r, message, reply_to, now),
             )
             ids.append(f"#{cur.lastrowid} -> {r}")
         return "Sent " + ", ".join(ids) if ids else "No other peers to send to."
@@ -466,9 +466,10 @@ def gui_send(to, body, reply_to=None):
         recipients = names if to == "*" else [to]
         if not body.strip() or not recipients or any(r not in names for r in recipients):
             raise ValueError(f"Unknown peer '{to}'" if body.strip() else "Empty message")
+        now = time.time()
         return [db.execute(
             "INSERT INTO messages (sender, recipient, body, reply_to, created) VALUES ('human', ?, ?, ?, ?)",
-            (r, body, reply_to, time.time()),
+            (r, body, reply_to, now),
         ).lastrowid for r in recipients]
     finally:
         db.close()
@@ -552,12 +553,12 @@ GUI_PAGE = r"""<!doctype html>
 <style>
 :root {
   --bg: #f6f6f4; --panel: #ffffff; --line: #e3e2de; --text: #1f1f1d; --muted: #6f6e69;
-  --accent: #c2410c; --human: #fff7ed; --hl: #fde68a; --ok: #16a34a; --idle: #a8a29e;
+  --accent: #c2410c; --mine: #fff1e3; --hl: #fde68a; --ok: #16a34a; --idle: #a8a29e;
 }
 @media (prefers-color-scheme: dark) {
   :root {
     --bg: #161615; --panel: #1f1f1d; --line: #33322f; --text: #ecebe7; --muted: #9b9a94;
-    --accent: #fb923c; --human: #2a2119; --hl: #5b4a12; --ok: #4ade80; --idle: #57534e;
+    --accent: #fb923c; --mine: #3a2a1c; --hl: #5b4a12; --ok: #4ade80; --idle: #57534e;
   }
 }
 * { box-sizing: border-box; }
@@ -567,12 +568,12 @@ aside { width: 280px; flex: none; border-right: 1px solid var(--line); backgroun
   display: flex; flex-direction: column; overflow-y: auto; }
 aside h2 { font-size: 11px; text-transform: uppercase; letter-spacing: .06em; color: var(--muted);
   margin: 16px 16px 6px; }
-.peer { padding: 8px 16px; cursor: pointer; border-left: 3px solid transparent; }
-.peer:hover { background: var(--bg); }
-.peer.active { border-left-color: var(--accent); background: var(--bg); }
-.peer .name { font-weight: 600; display: flex; align-items: center; gap: 6px; }
-.peer .meta, .peer .summary { color: var(--muted); font-size: 12px; overflow: hidden;
-  text-overflow: ellipsis; white-space: nowrap; }
+.view { padding: 8px 16px; cursor: pointer; border-left: 3px solid transparent; }
+.view:hover { background: var(--bg); }
+.view.active { border-left-color: var(--accent); background: var(--bg); }
+.view .name { font-weight: 600; display: flex; align-items: center; gap: 6px; }
+.view .name .count { margin-left: auto; }
+.view .meta { color: var(--muted); font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--idle); flex: none; }
 .dot.on { background: var(--ok); }
 details, .nonotes { padding: 0 16px 6px; font-size: 12px; }
@@ -580,23 +581,26 @@ details, .nonotes { padding: 0 16px 6px; font-size: 12px; }
 details summary { cursor: pointer; font-weight: 600; }
 details pre { white-space: pre-wrap; margin: 4px 0 8px; color: var(--muted); font-size: 12px; }
 main { flex: 1; display: flex; flex-direction: column; min-width: 0; }
-header { padding: 12px 20px; border-bottom: 1px solid var(--line); display: flex; justify-content: space-between;
-  align-items: center; background: var(--panel); }
+header { padding: 12px 20px; border-bottom: 1px solid var(--line); display: flex; gap: 12px;
+  justify-content: space-between; align-items: center; background: var(--panel); }
 header h1 { font-size: 15px; margin: 0; }
-#status { font-size: 12px; color: var(--muted); }
-#log { flex: 1; overflow-y: auto; padding: 16px 20px; }
+header .sub { font-size: 12px; color: var(--muted); }
+#status { font-size: 12px; color: var(--muted); white-space: nowrap; }
+#log { flex: 1; overflow-y: auto; padding: 16px 20px; display: flex; flex-direction: column; }
 .msg { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 8px 12px;
   margin-bottom: 10px; max-width: 900px; transition: background .4s; }
-.msg.human { background: var(--human); }
+.dm .msg { max-width: min(720px, 85%); align-self: flex-start; border-radius: 12px 12px 12px 4px; }
+.dm .msg.mine { align-self: flex-end; background: var(--mine); border-radius: 12px 12px 4px 12px; }
 .msg.flash { background: var(--hl); }
 .msg .head { font-size: 12px; color: var(--muted); display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
 .msg .who { font-weight: 600; color: var(--text); }
 .msg .body { white-space: pre-wrap; word-wrap: break-word; margin-top: 4px; }
 .badge { font-size: 11px; padding: 0 6px; border-radius: 9px; background: var(--accent); color: #fff; }
+.tag { font-size: 11px; padding: 0 6px; border-radius: 9px; border: 1px solid var(--line); }
 a.ref { color: var(--accent); cursor: pointer; text-decoration: none; }
 .empty { color: var(--muted); text-align: center; margin-top: 40px; }
 form { display: flex; gap: 8px; padding: 12px 20px; border-top: 1px solid var(--line); background: var(--panel); }
-select, textarea, button { font: inherit; color: var(--text); background: var(--bg);
+textarea, button { font: inherit; color: var(--text); background: var(--bg);
   border: 1px solid var(--line); border-radius: 6px; padding: 6px 8px; }
 textarea { flex: 1; resize: vertical; min-height: 38px; height: 38px; }
 button { background: var(--accent); color: #fff; border: none; padding: 6px 16px; cursor: pointer; }
@@ -606,24 +610,29 @@ button { background: var(--accent); color: #fff; border: none; padding: 6px 16px
 </head>
 <body>
 <aside>
-  <h2>Sessions</h2>
-  <div id="peers"></div>
+  <div id="channel"></div>
+  <h2>Direct messages</h2>
+  <div id="dms"></div>
   <h2>Shared notes</h2>
   <div id="notes"></div>
 </aside>
 <main>
-  <header><h1 id="title">All messages</h1><span id="status">connecting…</span></header>
+  <header><div><h1 id="title"></h1><div class="sub" id="sub"></div></div><span id="status">connecting…</span></header>
   <div id="log"></div>
   <form id="compose">
-    <select id="to" title="Recipient"></select>
-    <textarea id="body" placeholder="Message as human… (⌘/Ctrl+Enter to send)"></textarea>
+    <textarea id="body"></textarea>
     <button>Send</button>
   </form>
 </main>
 <script>
 const TOKEN = "__TOKEN__";
+const CHANNEL = "#channel";
 const $ = id => document.getElementById(id);
-let since = 0, filter = null, peers = [], messages = [], unread = new Set(), skew = 0;
+const fromHash = decodeURIComponent(location.hash.slice(1));
+let since = 0, view = fromHash && fromHash !== "channel" ? fromHash : CHANNEL, peers = [], messages = [], unread = new Set(), skew = 0;
+let lastRead = {};  // view -> highest message id seen there (this browser only)
+try { lastRead = JSON.parse(localStorage.getItem("bridge.lastRead")) || {}; } catch (e) {}
+const firstVisit = !Object.keys(lastRead).length;
 
 function el(tag, cls, text) {
   const e = document.createElement(tag);
@@ -649,30 +658,72 @@ async function api(path, body) {
   return data;
 }
 
-function renderPeers() {
-  const box = $("peers");
-  box.replaceChildren();
-  const all = el("div", "peer" + (filter ? "" : " active"));
-  all.append(el("div", "name", "All messages"), el("div", "meta", messages.length + " messages"));
-  all.onclick = () => setFilter(null);
-  box.append(all);
-  for (const p of peers) {
-    const d = el("div", "peer" + (filter === p.name ? " active" : ""));
-    const name = el("div", "name");
+// A broadcast is stored as one row per recipient; fold those back into one item.
+function groups() {
+  const out = [];
+  for (const m of messages) {
+    const g = out[out.length - 1];
+    if (g && g.sender === m.sender && g.body === m.body && Math.abs(g.created - m.created) < 2
+        && !g.rows.some(r => r.recipient === m.recipient)) {
+      g.rows.push(m);
+    } else {
+      out.push({sender: m.sender, body: m.body, created: m.created, reply_to: m.reply_to, rows: [m]});
+    }
+  }
+  return out;
+}
+const isBroadcast = g => g.rows.length > 1;
+// Which views a group shows up in: broadcasts and session-to-session talk go to the channel;
+// anything between you and one session is a DM (your broadcast copies also show in each DM for context).
+function viewsOf(g) {
+  if (g.sender === "human") return isBroadcast(g) ? [CHANNEL, ...g.rows.map(r => r.recipient)] : [g.rows[0].recipient];
+  if (g.rows[0].recipient === "human") return [g.sender];
+  return [CHANNEL];
+}
+function itemsFor(v) {
+  const out = [];
+  for (const g of groups()) {
+    if (!viewsOf(g).includes(v)) continue;
+    // in a DM, show only that session's copy of a broadcast
+    const broadcast = isBroadcast(g);
+    out.push(v === CHANNEL ? {...g, broadcast} : {...g, broadcast, rows: g.rows.filter(r => r.sender !== "human" || r.recipient === v)});
+  }
+  return out;
+}
+function unreadCount(v) {
+  const seen = lastRead[v] || 0;
+  return itemsFor(v).filter(g => g.sender !== "human" && Math.max(...g.rows.map(r => r.id)) > seen).length;
+}
+function markRead(v) {
+  const ids = itemsFor(v).flatMap(g => g.rows.map(r => r.id));
+  if (!ids.length) return;
+  lastRead[v] = Math.max(lastRead[v] || 0, ...ids);
+  try { localStorage.setItem("bridge.lastRead", JSON.stringify(lastRead)); } catch (e) {}
+}
+
+function viewEntry(v, label, meta, extra) {
+  const d = el("div", "view" + (view === v ? " active" : ""));
+  const name = el("div", "name");
+  if (extra) name.append(extra);
+  name.append(el("span", null, label));
+  const n = view === v ? 0 : unreadCount(v);
+  if (n) name.append(el("span", "badge count", String(n)));
+  d.append(name, el("div", "meta", meta));
+  d.onclick = () => setView(v);
+  return d;
+}
+
+function renderSidebar() {
+  $("channel").replaceChildren(viewEntry(CHANNEL, "# Channel", "sessions talking to each other"));
+  $("dms").replaceChildren(...peers.map(p => {
     const dot = el("span", "dot" + (p.listening ? " on" : ""));
     dot.title = p.listening ? "listener running: messages wake this session"
                             : "no listener: messages wait until this session's next prompt";
-    name.append(dot, el("span", null, p.name));
-    d.append(name, el("div", "meta", (p.listening ? "listening" : "not listening") + " · seen " + ago(p.last_seen)));
-    d.append(el("div", "meta", p.cwd));
-    if (p.summary) d.append(el("div", "summary", p.summary));
-    d.title = p.summary || p.cwd;
-    d.onclick = () => setFilter(p.name);
-    box.append(d);
-  }
-  const sel = $("to"), cur = sel.value;
-  sel.replaceChildren(new Option("everyone (*)", "*"), ...peers.map(p => new Option(p.name, p.name)));
-  sel.value = filter || (peers.some(p => p.name === cur) || cur === "*" ? cur : (peers[0] || {}).name || "*");
+    const e = viewEntry(p.name, p.name, (p.listening ? "listening" : "not listening") + " · seen " + ago(p.last_seen)
+                        + (p.summary ? " · " + p.summary : ""), dot);
+    e.title = p.cwd + (p.summary ? "\n" + p.summary : "");
+    return e;
+  }));
 }
 
 function renderNotes(notes) {
@@ -689,55 +740,91 @@ function renderNotes(notes) {
 function renderLog() {
   const log = $("log");
   const atBottom = log.scrollHeight - log.scrollTop - log.clientHeight < 40;
-  const shown = filter ? messages.filter(m => m.sender === filter || m.recipient === filter) : messages;
+  const dm = view !== CHANNEL;
+  log.className = dm ? "dm" : "";
   log.replaceChildren();
-  if (!shown.length) log.append(el("div", "empty", "No messages yet."));
-  for (const m of shown) {
-    const d = el("div", "msg" + (m.sender === "human" ? " human" : ""));
-    d.id = "m" + m.id;
+  const items = itemsFor(view);
+  if (!items.length) log.append(el("div", "empty", dm ? "No messages with " + view + " yet. Only you and " + view + " see this conversation."
+                                                    : "Nothing yet. Messages between sessions, and anything you send to everyone, show up here."));
+  for (const g of items) {
+    const mine = g.sender === "human";
+    const d = el("div", "msg" + (mine ? " mine" : ""));
+    d.dataset.ids = " " + g.rows.map(r => r.id).join(" ") + " ";
     const head = el("div", "head");
-    head.append(el("span", "who", m.sender + " → " + m.recipient), el("span", null, "#" + m.id));
-    if (m.reply_to) {
-      const a = el("a", "ref", "↩ #" + m.reply_to);
-      a.onclick = () => jump(m.reply_to);
+    if (dm) {
+      head.append(el("span", "who", mine ? "you" : g.sender));
+      if (mine && g.broadcast) head.append(el("span", "tag", "to everyone"));
+    } else {
+      const to = g.broadcast ? "everyone" : g.rows[0].recipient;
+      head.append(el("span", "who", (mine ? "you" : g.sender) + " → " + to));
+    }
+    if (g.reply_to) {
+      const a = el("a", "ref", "↩ #" + g.reply_to);
+      a.onclick = () => jump(g.reply_to);
       head.append(a);
     }
-    head.append(el("span", null, ago(m.created)));
-    if (unread.has(m.id)) head.append(el("span", "badge", "unread"));
-    d.append(head, el("div", "body", m.body));
+    head.append(el("span", null, ago(g.created)));
+    const waiting = g.rows.filter(r => unread.has(r.id) && r.recipient !== "human").map(r => r.recipient);
+    if (waiting.length) {
+      const b = el("span", "badge", g.broadcast && !dm ? "waiting: " + waiting.join(", ") : "not picked up yet");
+      b.title = "The recipient hasn't read this yet";
+      head.append(b);
+    }
+    d.append(head, el("div", "body", g.body));
     log.append(d);
   }
   if (atBottom) log.scrollTop = log.scrollHeight;
 }
 
+function render() {
+  if (view !== CHANNEL && !peers.some(p => p.name === view)) view = CHANNEL;
+  markRead(view);
+  const dm = view !== CHANNEL;
+  $("title").textContent = dm ? "@ " + view : "# Channel";
+  $("sub").textContent = dm ? "Private: just you and " + view + ". Its answers to you land here."
+                            : "Sessions talking to each other, and messages you send to everyone.";
+  $("body").placeholder = (dm ? "Message " + view + " privately" : "Message every session") + "… (⌘/Ctrl+Enter to send)";
+  renderSidebar();
+  renderLog();
+}
+
+function find(id) {
+  return [...$("log").children].find(c => c.dataset.ids && c.dataset.ids.includes(" " + id + " "));
+}
 function jump(id) {
-  let t = $("m" + id);
-  if (!t && filter) { setFilter(null); t = $("m" + id); }
+  let t = find(id);
+  if (!t) {
+    const g = groups().find(g => g.rows.some(r => r.id === id));
+    if (!g) return;
+    const vs = viewsOf(g);
+    setView(vs.includes(CHANNEL) ? CHANNEL : vs[0]);
+    t = find(id);
+  }
   if (!t) return;
   t.scrollIntoView({behavior: "smooth", block: "center"});
   t.classList.add("flash");
   setTimeout(() => t.classList.remove("flash"), 1200);
 }
 
-function setFilter(name) {
-  filter = name;
-  $("title").textContent = name ? "Conversations with " + name : "All messages";
-  renderPeers();
-  renderLog();
+function setView(v) {
+  view = v;
+  history.replaceState(null, "", v === CHANNEL ? "#channel" : "#" + encodeURIComponent(v));
+  render();
   $("log").scrollTop = $("log").scrollHeight;
 }
 
 async function poll() {
   try {
     const s = await api("/api/state?since=" + since);
+    const first = since === 0;
     skew = Date.now() / 1000 - s.now;
     peers = s.peers;
     messages.push(...s.messages);
     if (s.messages.length) since = s.messages[s.messages.length - 1].id;
     unread = new Set(s.unread);
-    renderPeers();
+    if (first && firstVisit) [CHANNEL, ...peers.map(p => p.name)].forEach(markRead);  // don't flag old history
+    render();
     renderNotes(s.notes);
-    renderLog();
     $("status").textContent = "live · " + peers.length + " sessions";
   } catch (e) {
     $("status").textContent = "disconnected (" + e.message + ")";
@@ -750,7 +837,7 @@ $("compose").onsubmit = async ev => {
   const body = $("body").value;
   if (!body.trim()) return;
   try {
-    await api("/api/send", {to: $("to").value, body});
+    await api("/api/send", {to: view === CHANNEL ? "*" : view, body});
     $("body").value = "";
   } catch (e) {
     alert("Send failed: " + e.message);

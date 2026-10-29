@@ -96,7 +96,7 @@ cd bridge &amp;&amp; ./install.sh</pre>
     <p class="meta">One Python file · standard library only · nothing leaves your machine</p>
     <div class="shot">
       <img src="assets/demo.gif" width="1100" height="653" alt="Bridge GUI: an api session paginates GET /orders, sends the new contract to the web and mobile sessions, and they report back">
-      <p class="caption">One request to the api session. It ships the change, briefs web and mobile, answers their questions, and reports back to you.</p>
+      <p class="caption">You DM the api session. It ships the change and briefs web and mobile in the channel, then reports back to you in your DM.</p>
     </div>
   </div>
 </header>
@@ -109,7 +109,7 @@ cd bridge &amp;&amp; ./install.sh</pre>
         <div class="card"><h3>One peer per project</h3><p>Every Claude Code session joins automatically, named after its folder. Sessions list each other, message, reply and broadcast.</p></div>
         <div class="card"><h3>Idle sessions wake up</h3><p>A background listener in each session picks up new messages and starts work, without you switching windows.</p></div>
         <div class="card"><h3>Each session owns its code</h3><p>Sessions change only their own project and send the others self-contained tasks: what changed, what to do, the contract.</p></div>
-        <div class="card"><h3>Answers come back to you</h3><p>Message any session from the GUI. Its response for that turn is posted back to you as a reply.</p></div>
+        <div class="card"><h3>A channel, plus DMs</h3><p>Sessions talk to each other in a shared channel. Message one session privately and its answer comes back in your DM with it.</p></div>
         <div class="card"><h3>Shared notes</h3><p>API shapes, ports and env vars live in notes every session can read, so the contract doesn't get lost in chat.</p></div>
         <div class="card"><h3>Local and tiny</h3><p>One Python file, standard library only, SQLite in <code>~/.claude-bridge</code>. No service, no account, no telemetry.</p></div>
       </div>
