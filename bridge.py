@@ -18,6 +18,8 @@ Usage:
     bridge.py log [N]          # show the last N messages
     bridge.py gui [PORT]       # local web UI for messages across sessions (--no-open: don't launch a browser)
 """
+import base64
+import binascii
 import json
 import os
 import runpy
@@ -159,6 +161,39 @@ def store_attachments(paths):
             raise ValueError(f"{p}: larger than {MAX_ATTACHMENT_BYTES // 2**20} MB.")
         dest = os.path.join(FILES_DIR, f"{uuid.uuid4().hex[:12]}-{os.path.basename(p)}")
         shutil.copyfile(p, dest)
+        stored.append(dest)
+    return stored
+
+
+def store_uploads(images):
+    """Save images uploaded from the GUI ([{name, data: base64}]) into FILES_DIR; returns the stored paths."""
+    if not images:
+        return []
+    if len(images) > MAX_ATTACHMENTS:
+        raise ValueError(f"At most {MAX_ATTACHMENTS} images per message.")
+    magic = {b"\x89PNG": ".png", b"\xff\xd8\xff": ".jpg", b"GIF8": ".gif"}
+    blobs = []
+    for img in images:
+        try:
+            data = base64.b64decode(str(img.get("data", "")), validate=True)
+        except binascii.Error:
+            raise ValueError("Couldn't read an uploaded image.")
+        ext = next((e for sig, e in magic.items() if data.startswith(sig)), None)
+        if not ext and data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+            ext = ".webp"
+        if not ext:
+            raise ValueError("Only PNG, JPG, GIF and WebP images can be attached.")
+        if len(data) > MAX_ATTACHMENT_BYTES:
+            raise ValueError(f"Images must be {MAX_ATTACHMENT_BYTES // 2**20} MB or smaller.")
+        stem = os.path.splitext(os.path.basename(str(img.get("name") or "image")))[0]
+        stem = "".join(c if c.isalnum() or c in "-_." else "-" for c in stem)[:60] or "image"
+        blobs.append((stem + ext, data))
+    os.makedirs(FILES_DIR, exist_ok=True)
+    stored = []
+    for name, data in blobs:
+        dest = os.path.join(FILES_DIR, f"{uuid.uuid4().hex[:12]}-{name}")
+        with open(dest, "wb") as f:
+            f.write(data)
         stored.append(dest)
     return stored
 
@@ -611,19 +646,24 @@ def gui_state(since):
         db.close()
 
 
-def gui_send(to, body, reply_to=None, channel=False):
-    """Send as the human. `to` is a peer name, a list of them (@mentions in #everyone), or '*'."""
+def gui_send(to, body, reply_to=None, channel=False, images=None):
+    """Send as the human. `to` is a peer name, a list of them (@mentions in #everyone), or '*'.
+    `images` are uploads from the GUI: [{name, data: base64}]."""
     db = connect()
     try:
         names = [r["name"] for r in db.execute("SELECT name FROM peers")]
         recipients = names if to == "*" else [to] if isinstance(to, str) else list(dict.fromkeys(to))
         unknown = [r for r in recipients if r not in names]
-        if not body.strip() or not recipients or unknown:
-            raise ValueError(f"Unknown peer '{unknown[0] if unknown else to}'" if body.strip() else "Empty message")
+        if not body.strip() and not images:
+            raise ValueError("Empty message")
+        if not recipients or unknown:
+            raise ValueError(f"Unknown peer '{unknown[0] if unknown else to}'")
+        files = store_uploads(images)
         now = time.time()
         return [db.execute(
-            "INSERT INTO messages (sender, recipient, body, reply_to, created, channel) VALUES ('human', ?, ?, ?, ?, ?)",
-            (r, body, reply_to, now, int(channel or to == "*")),
+            "INSERT INTO messages (sender, recipient, body, reply_to, created, channel, attachments) "
+            "VALUES ('human', ?, ?, ?, ?, ?, ?)",
+            (r, body, reply_to, now, int(channel or to == "*"), json.dumps(files) if files else None),
         ).lastrowid for r in recipients]
     finally:
         db.close()
@@ -704,7 +744,10 @@ def gui(port=8765, open_browser=True):
                 to = data.get("to", "")
                 to = [str(t) for t in to] if isinstance(to, list) else str(to)
                 reply_to = int(data["reply_to"]) if data.get("reply_to") else None
-                ids = gui_send(to, str(data.get("body", "")), reply_to, bool(data.get("channel")))
+                images = data.get("images") or []
+                if not isinstance(images, list) or not all(isinstance(i, dict) for i in images):
+                    raise ValueError("Bad images")
+                ids = gui_send(to, str(data.get("body", "")), reply_to, bool(data.get("channel")), images)
             except (ValueError, TypeError) as e:
                 return self.respond(400, {"error": str(e)})
             self.respond(200, {"ids": ids})
@@ -852,6 +895,16 @@ form { padding: 0 16px 20px; position: relative; }
 .box { display: flex; align-items: flex-end; background: var(--input); border-radius: 8px; padding: 0 12px; }
 textarea { flex: 1; border: 0; outline: 0; resize: none; background: transparent; color: var(--text); font: inherit;
   padding: 11px 0; max-height: 40vh; height: 44px; }
+.box .attach { flex: none; width: 24px; height: 24px; margin: 10px 12px 10px 0; padding: 0; border: 0; border-radius: 50%;
+  background: var(--muted); color: var(--input); font-size: 18px; font-weight: 700; line-height: 24px; cursor: pointer; }
+.box .attach:hover { background: var(--text); }
+.pending { display: flex; flex-wrap: wrap; gap: 10px; }
+.pending:not(:empty) { padding: 6px 0 10px; }
+.pending .pi { position: relative; }
+.pending img { display: block; width: 72px; height: 72px; object-fit: cover; border-radius: 8px; border: 1px solid var(--line); }
+.pending button { position: absolute; top: -7px; right: -7px; width: 20px; height: 20px; padding: 0; border: 0; border-radius: 50%;
+  background: var(--red); color: #fff; font-size: 13px; line-height: 20px; cursor: pointer; }
+.dragging { outline: 2px dashed var(--accent); outline-offset: -6px; }
 .hint { font-size: 12px; color: var(--muted); padding: 4px 2px 0; }
 @media (max-width: 700px) { body { flex-direction: column; } aside { width: auto; max-height: 40vh; }
   #thread { position: fixed; inset: 0; width: auto; background: var(--main); z-index: 5; } }
@@ -876,7 +929,9 @@ textarea { flex: 1; border: 0; outline: 0; resize: none; background: transparent
     <div class="log" id="log"></div>
     <form id="compose">
       <div class="mentions" hidden></div>
-      <div class="box"><textarea rows="1"></textarea></div>
+      <div class="pending"></div>
+      <div class="box"><button type="button" class="attach" title="Attach images (or paste / drop them)">+</button>
+        <textarea rows="1"></textarea><input type="file" accept="image/png,image/jpeg,image/gif,image/webp" multiple hidden></div>
       <div class="hint"></div>
     </form>
   </div>
@@ -886,7 +941,9 @@ textarea { flex: 1; border: 0; outline: 0; resize: none; background: transparent
     <div class="log" id="tlog"></div>
     <form id="tcompose">
       <div class="mentions" hidden></div>
-      <div class="box"><textarea rows="1" placeholder="Reply in thread…"></textarea></div>
+      <div class="pending"></div>
+      <div class="box"><button type="button" class="attach" title="Attach images (or paste / drop them)">+</button>
+        <textarea rows="1" placeholder="Reply in thread…"></textarea><input type="file" accept="image/png,image/jpeg,image/gif,image/webp" multiple hidden></div>
       <div class="hint"></div>
     </form>
   </section>
@@ -1248,7 +1305,7 @@ function render() {
                               : "Sessions coordinating with each other";
   main.input.placeholder = dm ? "Message @" + view : "Message #everyone · type @ to mention a session";
   $("compose").querySelector(".hint").textContent =
-    (dm ? "Only " + view + " sees this · " : "@mention sessions to ask just them · ") + "Enter to send · Shift+Enter for a new line";
+    (dm ? "Only " + view + " sees this · " : "@mention sessions to ask just them · ") + "Enter to send · Shift+Enter for a new line · paste or drop images";
   renderSidebar(M);
   renderMain(M);
   renderThread(M);
@@ -1323,10 +1380,56 @@ async function poll() {
   setTimeout(poll, 1500);
 }
 
-// A send box with the @mention picker. payload(body) says who it goes to.
-function composer(form, payload, canMention) {
+const IMAGE_TYPES = ["image/png", "image/jpeg", "image/gif", "image/webp"];
+const asBase64 = file => new Promise((ok, fail) => {
+  const r = new FileReader();
+  r.onload = () => ok(String(r.result).split(",")[1]);
+  r.onerror = () => fail(new Error("couldn't read " + file.name));
+  r.readAsDataURL(file);
+});
+// A send box with the @mention picker and image attachments (button, paste or drop onto dropZone).
+// payload(body) says who it goes to.
+function composer(form, payload, canMention, dropZone) {
   const input = form.querySelector("textarea"), box = form.querySelector(".mentions");
-  let menu = {items: [], index: 0, start: 0};
+  const picker = form.querySelector("input[type=file]"), pending = form.querySelector(".pending");
+  let menu = {items: [], index: 0, start: 0}, files = [], sending = false;
+  function addFiles(list) {
+    for (const f of list) {
+      if (!IMAGE_TYPES.includes(f.type)) { alert(f.name + ": only PNG, JPG, GIF and WebP images can be attached."); continue; }
+      if (f.size > 10 * 1024 * 1024) { alert(f.name + " is larger than 10 MB."); continue; }
+      if (files.length >= 5) { alert("At most 5 images per message."); break; }
+      files.push({file: f, url: URL.createObjectURL(f)});
+    }
+    showPending();
+    input.focus();
+  }
+  function showPending() {
+    pending.replaceChildren(...files.map((x, i) => {
+      const d = el("div", "pi"), img = el("img"), rm = el("button", null, "×");
+      img.src = x.url;
+      img.title = x.file.name;
+      rm.type = "button";
+      rm.title = "Remove";
+      rm.onclick = () => { URL.revokeObjectURL(x.url); files.splice(i, 1); showPending(); };
+      d.append(img, rm);
+      return d;
+    }));
+  }
+  form.querySelector(".attach").onclick = () => picker.click();
+  picker.onchange = () => { addFiles(picker.files); picker.value = ""; };
+  input.onpaste = ev => {
+    const imgs = [...(ev.clipboardData ? ev.clipboardData.files : [])];
+    if (imgs.length) { ev.preventDefault(); addFiles(imgs); }
+  };
+  const hasFiles = ev => [...ev.dataTransfer.types].includes("Files");
+  dropZone.addEventListener("dragover", ev => { if (hasFiles(ev)) { ev.preventDefault(); dropZone.classList.add("dragging"); } });
+  dropZone.addEventListener("dragleave", ev => { if (!dropZone.contains(ev.relatedTarget)) dropZone.classList.remove("dragging"); });
+  dropZone.addEventListener("drop", ev => {
+    dropZone.classList.remove("dragging");
+    if (!ev.dataTransfer.files.length) return;
+    ev.preventDefault();
+    addFiles(ev.dataTransfer.files);
+  });
   const close = () => { box.hidden = true; menu.items = []; };
   function update() {
     const before = input.value.slice(0, input.selectionStart);
@@ -1375,14 +1478,21 @@ function composer(form, payload, canMention) {
   form.onsubmit = async ev => {
     ev.preventDefault();
     const body = input.value;
-    if (!body.trim()) return;
+    if (sending || !body.trim() && !files.length) return;
+    sending = true;
     try {
-      await api("/api/send", payload(body));
+      const images = await Promise.all(files.map(async x => ({name: x.file.name, data: await asBase64(x.file)})));
+      await api("/api/send", {...payload(body), images});
       close();
       input.value = "";
       input.style.height = "";
+      files.forEach(x => URL.revokeObjectURL(x.url));
+      files = [];
+      showPending();
     } catch (e) {
       alert("Send failed: " + e.message);
+    } finally {
+      sending = false;
     }
   };
   return {input};
@@ -1391,14 +1501,14 @@ const main = composer($("compose"), body => {
   if (view !== CHANNEL) return {to: view, body};
   const tagged = mentionsIn(body);
   return {to: !tagged.length || tagged.includes("everyone") ? "*" : tagged, body, channel: true};
-}, () => view === CHANNEL);
+}, () => view === CHANNEL, document.querySelector(".chat"));
 const side = composer($("tcompose"), body => {
   const M = model(), root = M.roots.find(g => g.key === thread);
   const reps = M.threads.get(thread) || [], last = reps.length ? reps[reps.length - 1] : root;
   const tagged = mentionsIn(body), who = threadPeople(M, root);
   const to = tagged.includes("everyone") ? "*" : tagged.length ? tagged : who.length ? who : "*";
   return {to, body, channel: true, reply_to: last.rows[0].id};
-}, () => true);
+}, () => true, $("thread"));
 
 document.addEventListener("visibilitychange", () => { if (!document.hidden) render(); });
 renderNotify();
