@@ -85,10 +85,22 @@ def connect():
     return db
 
 
-def register(db, cwd):
-    """Return this session's peer name, keyed by project directory."""
+def register(db, cwd, exact=False):
+    """Return this session's peer name, keyed by project directory.
+
+    Claude Code's project root wins when it is known (hooks get CLAUDE_PROJECT_DIR). Otherwise, unless `exact`,
+    a folder inside an already registered project resolves to that project, so a shell that cd'd into a
+    subfolder doesn't turn into a new peer. The MCP server and session start run in the project root, so they're exact.
+    """
+    root = os.environ.get("CLAUDE_PROJECT_DIR")
+    if root:
+        cwd, exact = root, True
     cwd = os.path.realpath(cwd)
     row = db.execute("SELECT name FROM peers WHERE cwd = ?", (cwd,)).fetchone()
+    if not row and not exact:
+        owners = [r for r in db.execute("SELECT name, cwd FROM peers")
+                  if r["cwd"] != os.sep and cwd.startswith(r["cwd"].rstrip(os.sep) + os.sep)]
+        row = max(owners, key=lambda r: len(r["cwd"]), default=None)  # innermost project
     if row:
         name = row["name"]
     else:
@@ -169,9 +181,9 @@ def take_unread(db, name):
 # --- tools -----------------------------------------------------------------
 
 class Bridge:
-    def __init__(self, cwd):
+    def __init__(self, cwd, exact=False):
         self.db = connect()
-        self.me = register(self.db, cwd)
+        self.me = register(self.db, cwd, exact)
 
     def peers(self):
         rows = self.db.execute("SELECT * FROM peers ORDER BY last_seen DESC").fetchall()
@@ -377,7 +389,7 @@ INBOUND_HINT = (
 
 def serve():
     code = {"mtime": os.path.getmtime(__file__), "g": globals()}
-    bridge = Bridge(os.getcwd())
+    bridge = Bridge(os.getcwd(), exact=True)
 
     def write(msg):
         sys.stdout.write(json.dumps(msg) + "\n")
@@ -396,7 +408,7 @@ def serve():
             code["mtime"] = mtime
             try:
                 g = runpy.run_path(__file__)  # runs as a plain module, so it won't start serving
-                bridge, code["g"] = g["Bridge"](os.getcwd()), g
+                bridge, code["g"] = g["Bridge"](os.getcwd(), exact=True), g
                 write({"jsonrpc": "2.0", "method": "notifications/tools/list_changed"})
             except Exception:  # a half-saved or broken edit: keep serving the code we have
                 pass
@@ -498,7 +510,7 @@ def hook():
 def session_start():
     data = hook_input()
     db = connect()
-    me = register(db, data.get("cwd") or os.getcwd())
+    me = register(db, data.get("cwd") or os.getcwd(), exact=True)
     rows = db.execute("SELECT * FROM peers ORDER BY name").fetchall()
     others = [f"- **{r['name']}**: {r['cwd']}" + (f" ({r['summary']})" if r["summary"] else "")
               for r in rows if r["name"] != me]
