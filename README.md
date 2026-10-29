@@ -22,6 +22,8 @@ of the change and report back. You watch, and join in, from one local page.
   channel where sessions @mention each other, and a private DM with each session. Message one
   session and its answer lands in that DM with a red unread badge (and an optional desktop
   notification); when it needs another session, it asks in `#everyone`, where you can follow along.
+  You can @mention sessions there too: `@web` asks just that session, and its answer comes back in
+  the channel; a post without a mention reaches every session.
 - **Nothing to install but Python.** One file, standard library only, SQLite at
   `~/.claude-bridge`. Nothing leaves your machine.
 

@@ -62,10 +62,16 @@ def connect():
     db.row_factory = sqlite3.Row
     db.execute("PRAGMA journal_mode=WAL")
     db.executescript(SCHEMA)
-    try:  # id of the latest human message whose answer hasn't been relayed back yet
-        db.execute("ALTER TABLE peers ADD COLUMN pending_human INTEGER")
-    except sqlite3.OperationalError:
-        pass
+    for migration in (
+        # id of the latest human message whose answer hasn't been relayed back yet
+        "ALTER TABLE peers ADD COLUMN pending_human INTEGER",
+        # 1 when the human posted it in #everyone (or it answers such a post) rather than in a DM
+        "ALTER TABLE messages ADD COLUMN channel INTEGER NOT NULL DEFAULT 0",
+    ):
+        try:
+            db.execute(migration)
+        except sqlite3.OperationalError:
+            pass
     return db
 
 
@@ -101,7 +107,8 @@ def ago(ts):
 
 
 def fmt_message(m):
-    head = f"[#{m['id']} from {m['sender']}, {ago(m['created'])}"
+    where = " in #everyone" if m["sender"] == "human" and m["channel"] else ""
+    head = f"[#{m['id']} from {m['sender']}{where}, {ago(m['created'])}"
     if m["reply_to"]:
         head += f", reply to #{m['reply_to']}"
     return f"{head}]\n{m['body']}"
@@ -260,8 +267,9 @@ INBOUND_HINT = (
     "Handle each message as the owner of this project: if it is a task, do it and tell the user what "
     "you did; then reply to the sender with `send` (reply_to=<id>) with a short report or answer. "
     "If it is just a report or acknowledgement needing nothing from you, don't reply; summarise it for the user. "
-    "Messages from 'human' are the user's private DM to you from the bridge GUI: your final response is relayed "
-    "back to that DM automatically, so answer in your response instead of `send`ing to human. If another "
+    "Messages from 'human' are the user writing from the bridge GUI, either privately to you or in #everyone: "
+    "your final response is relayed back to where they wrote automatically, so answer in your response instead "
+    "of `send`ing to human. If another "
     "session needs to act, ask it with `send`; that posts in the #everyone channel where it and the user see it."
 )
 
@@ -421,10 +429,11 @@ def relay_to_human(db, me, data):
         text = last_response(data.get("transcript_path"))
     if not text:
         return
+    asked = db.execute("SELECT channel FROM messages WHERE id = ?", (row["pending_human"],)).fetchone()
     now = time.time()
-    db.execute(
-        "INSERT INTO messages (sender, recipient, body, reply_to, created, read_at) VALUES (?, 'human', ?, ?, ?, ?)",
-        (me, text[:20000], row["pending_human"], now, now),
+    db.execute(  # answer where the human asked: their DM, or #everyone
+        "INSERT INTO messages (sender, recipient, body, reply_to, created, read_at, channel) VALUES (?, 'human', ?, ?, ?, ?, ?)",
+        (me, text[:20000], row["pending_human"], now, now, asked["channel"] if asked else 0),
     )
     db.execute("UPDATE peers SET pending_human = NULL WHERE name = ?", (me,))
 
@@ -465,17 +474,19 @@ def gui_state(since):
         db.close()
 
 
-def gui_send(to, body, reply_to=None):
+def gui_send(to, body, reply_to=None, channel=False):
+    """Send as the human. `to` is a peer name, a list of them (@mentions in #everyone), or '*'."""
     db = connect()
     try:
         names = [r["name"] for r in db.execute("SELECT name FROM peers")]
-        recipients = names if to == "*" else [to]
-        if not body.strip() or not recipients or any(r not in names for r in recipients):
-            raise ValueError(f"Unknown peer '{to}'" if body.strip() else "Empty message")
+        recipients = names if to == "*" else [to] if isinstance(to, str) else list(dict.fromkeys(to))
+        unknown = [r for r in recipients if r not in names]
+        if not body.strip() or not recipients or unknown:
+            raise ValueError(f"Unknown peer '{unknown[0] if unknown else to}'" if body.strip() else "Empty message")
         now = time.time()
         return [db.execute(
-            "INSERT INTO messages (sender, recipient, body, reply_to, created) VALUES ('human', ?, ?, ?, ?)",
-            (r, body, reply_to, now),
+            "INSERT INTO messages (sender, recipient, body, reply_to, created, channel) VALUES ('human', ?, ?, ?, ?, ?)",
+            (r, body, reply_to, now, int(channel or to == "*")),
         ).lastrowid for r in recipients]
     finally:
         db.close()
@@ -531,7 +542,9 @@ def gui(port=8765, open_browser=True):
                 return self.respond(404, {"error": "not found"})
             try:
                 data = json.loads(self.rfile.read(int(self.headers.get("Content-Length") or 0)))
-                ids = gui_send(str(data.get("to", "")), str(data.get("body", "")), data.get("reply_to") or None)
+                to = data.get("to", "")
+                to = [str(t) for t in to] if isinstance(to, list) else str(to)
+                ids = gui_send(to, str(data.get("body", "")), data.get("reply_to") or None, bool(data.get("channel")))
             except (ValueError, TypeError) as e:
                 return self.respond(400, {"error": str(e)})
             self.respond(200, {"ids": ids})
@@ -643,7 +656,17 @@ header .topic { color: var(--muted); font-size: 14px; overflow: hidden; text-ove
 .msg .text { white-space: pre-wrap; word-wrap: break-word; }
 .mention { background: var(--mention); color: var(--mention-text); border-radius: 4px; padding: 0 3px; font-weight: 600; }
 .msg .state { font-size: 12px; color: var(--muted); margin-top: 2px; }
-form { padding: 0 16px 20px; }
+form { padding: 0 16px 20px; position: relative; }
+.mentions { position: absolute; left: 16px; right: 16px; bottom: calc(100% - 12px); background: var(--side);
+  border-radius: 8px; padding: 8px; box-shadow: 0 8px 24px rgba(0, 0, 0, .3); }
+.mentions[hidden] { display: none; }
+.mentions .head { font-size: 12px; font-weight: 700; text-transform: uppercase; color: var(--muted); padding: 2px 8px 6px; }
+.mopt { display: flex; align-items: center; gap: 10px; padding: 6px 8px; border-radius: 4px; cursor: pointer; }
+.mopt.on { background: var(--sel); }
+.mopt .avatar { width: 24px; height: 24px; font-size: 12px; }
+.mopt .avatar .st { display: none; }
+.mopt .hash { width: 24px; text-align: center; font-weight: 700; color: var(--muted); }
+.mopt .sub { color: var(--muted); font-size: 13px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .box { display: flex; align-items: flex-end; background: var(--input); border-radius: 8px; padding: 0 12px; }
 textarea { flex: 1; border: 0; outline: 0; resize: none; background: transparent; color: var(--text); font: inherit;
   padding: 11px 0; max-height: 40vh; height: 44px; }
@@ -668,8 +691,9 @@ textarea { flex: 1; border: 0; outline: 0; resize: none; background: transparent
   <header><span class="title" id="title"></span><span class="topic" id="topic"></span></header>
   <div id="log"></div>
   <form id="compose">
+    <div class="mentions" id="mentions" hidden></div>
     <div class="box"><textarea id="body" rows="1"></textarea></div>
-    <div class="hint">Enter to send · Shift+Enter for a new line</div>
+    <div class="hint" id="hint"></div>
   </form>
 </main>
 <script>
@@ -734,26 +758,25 @@ function groups() {
   const out = [];
   for (const m of messages) {
     const g = out[out.length - 1];
-    if (g && g.sender === m.sender && g.body === m.body && Math.abs(g.created - m.created) < 2
-        && !g.rows.some(r => r.recipient === m.recipient)) {
+    if (g && g.sender === m.sender && g.body === m.body && g.channel === !!m.channel
+        && Math.abs(g.created - m.created) < 2 && !g.rows.some(r => r.recipient === m.recipient)) {
       g.rows.push(m);
     } else {
-      out.push({sender: m.sender, body: m.body, created: m.created, reply_to: m.reply_to, rows: [m]});
+      out.push({sender: m.sender, body: m.body, created: m.created, reply_to: m.reply_to, channel: !!m.channel, rows: [m]});
     }
   }
   for (const g of out) g.everyone = g.rows.length > 1;
   return out;
 }
-// Sessions talk in #everyone, addressed with @mentions. You and one session talk in a private DM;
-// your posts to everyone also appear in each DM so its replies have context.
+// Sessions talk in #everyone, addressed with @mentions; so do you when you post there, and their answers
+// come back there. You and one session talk privately in a DM.
 function viewsOf(g) {
-  if (g.sender === "human") return g.everyone ? [CHANNEL, ...g.rows.map(r => r.recipient)] : [g.rows[0].recipient];
-  if (g.rows[0].recipient === "human") return [g.sender];
-  return [CHANNEL];
+  const withHuman = g.sender === "human" || g.rows[0].recipient === "human";
+  if (!withHuman || g.channel || g.sender === "human" && g.everyone) return [CHANNEL];
+  return [g.sender === "human" ? g.rows[0].recipient : g.sender];
 }
 function itemsFor(v, all = groups()) {
-  return all.filter(g => viewsOf(g).includes(v))
-            .map(g => v === CHANNEL ? g : {...g, rows: g.rows.filter(r => r.sender !== "human" || r.recipient === v)});
+  return all.filter(g => viewsOf(g).includes(v));
 }
 function unreadCount(v, all) {
   const seen = lastRead[v] || 0;
@@ -764,6 +787,33 @@ function markRead(v, all) {
   if (!ids.length) return;
   lastRead[v] = Math.max(lastRead[v] || 0, ...ids);
   try { localStorage.setItem("bridge.lastRead", JSON.stringify(lastRead)); } catch (e) {}
+}
+
+const MENTION = /@([\w-]+(?:\.[\w-]+)*)/g;
+function mentionsIn(body) {
+  const names = new Set([...peers.map(p => p.name), "everyone"]);
+  return [...body.matchAll(MENTION)].map(m => m[1]).filter(n => names.has(n));
+}
+function withMentions(body) {
+  const names = new Set([...peers.map(p => p.name), "everyone"]);
+  const out = [];
+  let last = 0;
+  for (const m of body.matchAll(MENTION)) {
+    if (!names.has(m[1])) continue;
+    out.push(body.slice(last, m.index), el("span", "mention", m[0]));
+    last = m.index + m[0].length;
+  }
+  out.push(body.slice(last));
+  return out;
+}
+// who a channel post is for, minus anyone its text already @mentions
+function targets(g) {
+  if (g.rows[0].recipient === "human") return ["You"];
+  const to = new Set(g.rows.map(r => r.recipient));
+  const all = peers.filter(p => p.name !== g.sender).every(p => to.has(p.name));
+  const said = new Set(mentionsIn(g.body));
+  if (all && g.everyone) return said.size ? [] : ["everyone"];
+  return [...to].filter(n => !said.has(n));
 }
 
 function sidebarItem(v, icon, label, sub, count) {
@@ -831,7 +881,7 @@ function renderLog(all) {
                                + ". Its answers to you land here. When it needs another session, it asks in #everyone."));
   } else {
     intro.append(el("div", "big", "#"), el("h2", null, "Welcome to #everyone"),
-                 el("p", null, "Where the sessions talk to each other. A request addressed to a session @mentions it and wakes it up. Posting here reaches every session."));
+                 el("p", null, "Where the sessions talk to each other. @mention a session to ask just it, and its answer comes back here. A post without a mention reaches every session."));
   }
   log.append(intro);
   const byId = new Map(messages.map(m => [m.id, m]));
@@ -857,9 +907,8 @@ function renderLog(all) {
       c.append(meta);
     }
     const text = el("div", "text");
-    const to = g.everyone ? "@everyone" : dm ? null : "@" + g.rows[0].recipient;
-    if (to) text.append(el("span", "mention", to), " ");
-    text.append(g.body);
+    for (const t of dm ? [] : targets(g)) text.append(el("span", "mention", "@" + t), " ");
+    text.append(...withMentions(g.body));
     c.append(text);
     const waiting = g.rows.filter(r => unread.has(r.id) && r.recipient !== "human").map(r => r.recipient);
     if (waiting.length) c.append(el("div", "state", "⏳ Waiting for " + waiting.join(", ") + " to pick this up"));
@@ -876,9 +925,10 @@ function notify(all) {
   if (fresh.length) notified = fresh[fresh.length - 1].id;
   if (!("Notification" in window) || Notification.permission !== "granted") return;
   for (const m of fresh) {
-    if (!document.hidden && view === m.sender) continue;
-    const n = new Notification(m.sender + " replied", {body: m.body.slice(0, 200), tag: "bridge-" + m.id});
-    n.onclick = () => { window.focus(); setView(m.sender); n.close(); };
+    const where = m.channel ? CHANNEL : m.sender;
+    if (!document.hidden && view === where) continue;
+    const n = new Notification(m.sender + " replied" + (m.channel ? " in #everyone" : ""), {body: m.body.slice(0, 200), tag: "bridge-" + m.id});
+    n.onclick = () => { window.focus(); setView(where); n.close(); };
   }
 }
 
@@ -891,7 +941,8 @@ function render() {
   $("title").textContent = dm ? "@ " + view : "# everyone";
   $("topic").textContent = dm ? "Private · " + (peer && peer.summary || peer && peer.cwd || "")
                               : "Sessions coordinating with each other";
-  $("body").placeholder = dm ? "Message @" + view : "Message #everyone";
+  $("body").placeholder = dm ? "Message @" + view : "Message #everyone · type @ to mention a session";
+  $("hint").textContent = (dm ? "Only " + view + " sees this · " : "@mention sessions to ask just them · ") + "Enter to send · Shift+Enter for a new line";
   renderSidebar(all);
   renderLog(all);
 }
@@ -951,21 +1002,70 @@ $("compose").onsubmit = async ev => {
   const body = $("body").value;
   if (!body.trim()) return;
   try {
-    await api("/api/send", {to: view === CHANNEL ? "*" : view, body});
+    let payload = {to: view, body};
+    if (view === CHANNEL) {
+      const tagged = mentionsIn(body);
+      payload = {to: !tagged.length || tagged.includes("everyone") ? "*" : tagged, body, channel: true};
+    }
+    await api("/api/send", payload);
+    closeMenu();
     $("body").value = "";
     $("body").style.height = "";
   } catch (e) {
     alert("Send failed: " + e.message);
   }
 };
+// @mention picker
+let menu = {items: [], index: 0, start: 0};
+function closeMenu() { $("mentions").hidden = true; menu.items = []; }
+function updateMenu() {
+  const t = $("body");
+  const before = t.value.slice(0, t.selectionStart);
+  const m = view === CHANNEL && before.match(/(^|\s)@([\w.-]*)$/);
+  if (!m) return closeMenu();
+  const q = m[2].toLowerCase();
+  const opts = [...peers.map(p => ({name: p.name, sub: p.summary || p.cwd})), {name: "everyone", sub: "every session"}]
+    .filter(o => o.name.toLowerCase().startsWith(q));
+  if (!opts.length) return closeMenu();
+  menu = {items: opts, index: Math.min(menu.index, opts.length - 1), start: before.length - m[2].length - 1};
+  const box = $("mentions");
+  box.replaceChildren(el("div", "head", "Mention a session"));
+  opts.forEach((o, i) => {
+    const d = el("div", "mopt" + (i === menu.index ? " on" : ""));
+    d.append(o.name === "everyone" ? el("span", "hash", "@") : avatar(o.name), el("b", null, o.name), el("span", "sub", o.sub));
+    d.onmousedown = ev => { ev.preventDefault(); pick(i); };
+    box.append(d);
+  });
+  box.hidden = false;
+}
+function pick(i) {
+  const t = $("body"), o = menu.items[i];
+  const after = t.value.slice(t.selectionStart);
+  t.value = t.value.slice(0, menu.start) + "@" + o.name + " " + after;
+  t.selectionStart = t.selectionEnd = menu.start + o.name.length + 2;
+  closeMenu();
+  t.focus();
+}
 $("body").onkeydown = ev => {
+  if (menu.items.length) {
+    if (ev.key === "ArrowDown" || ev.key === "ArrowUp") {
+      ev.preventDefault();
+      menu.index = (menu.index + (ev.key === "ArrowDown" ? 1 : menu.items.length - 1)) % menu.items.length;
+      return updateMenu();
+    }
+    if (ev.key === "Enter" || ev.key === "Tab") { ev.preventDefault(); return pick(menu.index); }
+    if (ev.key === "Escape") return closeMenu();
+  }
   if (ev.key === "Enter" && !ev.shiftKey && !ev.isComposing) { ev.preventDefault(); $("compose").requestSubmit(); }
 };
 $("body").oninput = () => {
   const t = $("body");
   t.style.height = "";
   t.style.height = t.scrollHeight + "px";
+  menu.index = 0;
+  updateMenu();
 };
+$("body").onblur = closeMenu;
 document.addEventListener("visibilitychange", () => { if (!document.hidden) render(); });
 renderNotify();
 poll();
