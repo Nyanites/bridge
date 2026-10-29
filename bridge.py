@@ -575,7 +575,8 @@ aside h2 { font-size: 11px; text-transform: uppercase; letter-spacing: .06em; co
   text-overflow: ellipsis; white-space: nowrap; }
 .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--idle); flex: none; }
 .dot.on { background: var(--ok); }
-details { padding: 0 16px 6px; font-size: 12px; }
+details, .nonotes { padding: 0 16px 6px; font-size: 12px; }
+.nonotes { margin: 0; color: var(--muted); }
 details summary { cursor: pointer; font-weight: 600; }
 details pre { white-space: pre-wrap; margin: 4px 0 8px; color: var(--muted); font-size: 12px; }
 main { flex: 1; display: flex; flex-direction: column; min-width: 0; }
@@ -677,7 +678,7 @@ function renderPeers() {
 function renderNotes(notes) {
   const box = $("notes");
   box.replaceChildren();
-  if (!notes.length) box.append(el("details", null, "None yet."));
+  if (!notes.length) box.append(el("p", "nonotes", "None yet."));
   for (const n of notes) {
     const d = el("details");
     d.append(el("summary", null, n.key), el("pre", null, n.value + "\n— " + n.updated_by + ", " + ago(n.updated)));

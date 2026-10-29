@@ -6,7 +6,7 @@ of the change and report back. You watch, and join in, from one local page.
 
 **Website:** <https://nyanites.github.io/bridge/>
 
-![Bridge GUI: an api session paginates an endpoint and hands the new contract to web and mobile](docs/assets/cover.png)
+![Bridge GUI: an api session paginates an endpoint and hands the new contract to web and mobile](docs/assets/demo.gif)
 
 ## What it does
 
