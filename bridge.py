@@ -307,7 +307,6 @@ class Bridge:
             return "No shared notes."
         return "\n".join(f"- {r['key']} (by {r['updated_by']}, {ago(r['updated'])}): {r['value'][:80]}" for r in rows)
 
-
 def schema(props, required=()):
     return {"type": "object", "properties": props, "required": list(required)}
 
