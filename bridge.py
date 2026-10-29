@@ -952,7 +952,8 @@ const TOKEN = "__TOKEN__";
 const CHANNEL = "#everyone";
 const $ = id => document.getElementById(id);
 let since = 0, view = CHANNEL, thread = null, peers = [], messages = [];
-let unread = new Set(), skew = 0, notified = 0;
+let unread = new Set(), skew = 0, notified = 0, drawn = "", notesDrawn = "";
+const imgCache = new Map();  // reuse <img> elements across redraws so images don't flash
 let lastRead = {};  // view or "t<thread root id>" -> highest message id seen there (this browser only)
 try { lastRead = JSON.parse(localStorage.getItem("bridge.lastRead")) || {}; } catch (e) {}
 const firstVisit = !Object.keys(lastRead).length;
@@ -1187,11 +1188,15 @@ function messageEl(g, opts) {
       const a = el("a");
       a.href = url;
       a.target = "_blank";
-      const img = el("img");
-      img.src = url;
-      img.alt = name.replace(/^[0-9a-f]{12}-/, "");
-      img.title = img.alt;
-      img.onload = () => { if (opts.stick) opts.log.scrollTop = opts.log.scrollHeight; };
+      const key = opts.log.id + "|" + url;
+      let img = imgCache.get(key);
+      if (!img) {
+        img = el("img");
+        img.alt = img.title = name.replace(/^[0-9a-f]{12}-/, "");
+        img.onload = () => { if (opts.stick) opts.log.scrollTop = opts.log.scrollHeight; };
+        img.src = url;
+        imgCache.set(key, img);
+      }
       a.append(img);
       atts.append(a);
     }
@@ -1295,6 +1300,8 @@ function notify(M) {
 
 function render() {
   if (view !== CHANNEL && !peers.some(p => p.name === view)) view = CHANNEL;
+  drawn = JSON.stringify([since, [...unread], peers.map(p => [p.name, p.listening, p.summary, p.cwd]),
+                          view, thread, Math.floor(serverNow() / 60)]);
   const M = model();
   markRead(M);
   const dm = view !== CHANNEL;
@@ -1370,8 +1377,13 @@ async function poll() {
     } else {
       notify(model());
     }
-    render();
-    renderNotes(s.notes);
+    // Redraw only when something visible changed (plus once a minute for "2m ago" times). Rebuilding on
+    // every poll made the page flash, and peers' last_seen ticks every second, so it isn't part of this.
+    const state = JSON.stringify([since, s.unread, peers.map(p => [p.name, p.listening, p.summary, p.cwd]),
+                                  view, thread, Math.floor(serverNow() / 60)]);
+    if (state !== drawn) render();
+    const notes = JSON.stringify(s.notes);
+    if (notes !== notesDrawn) { notesDrawn = notes; renderNotes(s.notes); }
     $("status").textContent = peers.length + " sessions";
   } catch (e) {
     $("status").textContent = "offline";
