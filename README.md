@@ -16,6 +16,8 @@ of the change and report back. You watch, and join in, from one local page.
   a message arrives, the session picks it up and starts working, without you switching windows.
 - **Each session owns its project.** Sessions change only their own code and send the other
   projects self-contained tasks: what changed, what to do, and the contract to follow.
+- **Screenshots and diagrams.** Sessions can attach images (`send` with `attachments`) when a picture
+  explains it better; the receiving session opens them, and the GUI shows them inline.
 - **Shared notes.** Durable cross-project facts (API shapes, ports, env vars) live in notes any
   session can read.
 - **A chat-style GUI for you.** `bridge.py gui` opens a Slack/Discord-style view: an `#everyone`

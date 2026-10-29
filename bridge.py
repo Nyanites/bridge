@@ -19,13 +19,18 @@ Usage:
 import json
 import os
 import shlex
+import shutil
 import sqlite3
 import sys
 import time
 import urllib.parse
+import uuid
 
 DB_DIR = os.environ.get("CLAUDE_BRIDGE_DIR", os.path.expanduser("~/.claude-bridge"))
 DB_PATH = os.path.join(DB_DIR, "bridge.db")
+FILES_DIR = os.path.join(DB_DIR, "files")  # copies of images attached to messages
+IMAGE_TYPES = {".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".gif": "image/gif", ".webp": "image/webp"}
+MAX_ATTACHMENTS, MAX_ATTACHMENT_BYTES = 5, 10 * 1024 * 1024
 PEER_TTL = 15 * 60  # peers silent longer than this are shown as idle
 LISTEN_CMD = f"python3 {shlex.quote(os.path.realpath(__file__))} listen"
 
@@ -67,6 +72,8 @@ def connect():
         "ALTER TABLE peers ADD COLUMN pending_human INTEGER",
         # 1 when the human posted it in #everyone (or it answers such a post) rather than in a DM
         "ALTER TABLE messages ADD COLUMN channel INTEGER NOT NULL DEFAULT 0",
+        # JSON list of image paths under FILES_DIR
+        "ALTER TABLE messages ADD COLUMN attachments TEXT",
     ):
         try:
             db.execute(migration)
@@ -111,7 +118,34 @@ def fmt_message(m):
     head = f"[#{m['id']} from {m['sender']}{where}, {ago(m['created'])}"
     if m["reply_to"]:
         head += f", reply to #{m['reply_to']}"
-    return f"{head}]\n{m['body']}"
+    text = f"{head}]\n{m['body']}"
+    files = json.loads(m["attachments"] or "[]")
+    if files:
+        text += "\nAttached images (open each with the Read tool to see it):\n" + "\n".join(f"- {f}" for f in files)
+    return text
+
+
+def store_attachments(paths):
+    """Copy images into FILES_DIR so they outlive the sender's own files; returns the stored paths."""
+    if not paths:
+        return []
+    paths = [paths] if isinstance(paths, str) else list(paths)
+    if len(paths) > MAX_ATTACHMENTS:
+        raise ValueError(f"At most {MAX_ATTACHMENTS} images per message.")
+    os.makedirs(FILES_DIR, exist_ok=True)
+    stored = []
+    for p in paths:
+        p = os.path.abspath(os.path.expanduser(str(p)))
+        if os.path.splitext(p)[1].lower() not in IMAGE_TYPES:
+            raise ValueError(f"{p}: only {', '.join(IMAGE_TYPES)} images can be attached.")
+        if not os.path.isfile(p):
+            raise ValueError(f"{p}: file not found.")
+        if os.path.getsize(p) > MAX_ATTACHMENT_BYTES:
+            raise ValueError(f"{p}: larger than {MAX_ATTACHMENT_BYTES // 2**20} MB.")
+        dest = os.path.join(FILES_DIR, f"{uuid.uuid4().hex[:12]}-{os.path.basename(p)}")
+        shutil.copyfile(p, dest)
+        stored.append(dest)
+    return stored
 
 
 def take_unread(db, name):
@@ -155,20 +189,22 @@ class Bridge:
         self.db.execute("UPDATE peers SET summary = ? WHERE name = ?", (summary, self.me))
         return f"Updated description for '{self.me}'."
 
-    def send(self, to, message, reply_to=None):
+    def send(self, to, message, reply_to=None, attachments=None):
         recipients = [to]
         if to == "*":
             recipients = [r["name"] for r in self.db.execute("SELECT name FROM peers WHERE name != ?", (self.me,))]
         elif to != "human" and not self.db.execute("SELECT 1 FROM peers WHERE name = ?", (to,)).fetchone():
             return f"Unknown peer '{to}'. Known peers:\n{self.peers()}"
+        files = store_attachments(attachments)
         ids, now = [], time.time()  # one timestamp, so the GUI can show a broadcast once
         for r in recipients:
             cur = self.db.execute(
-                "INSERT INTO messages (sender, recipient, body, reply_to, created) VALUES (?, ?, ?, ?, ?)",
-                (self.me, r, message, reply_to, now),
+                "INSERT INTO messages (sender, recipient, body, reply_to, created, attachments) VALUES (?, ?, ?, ?, ?, ?)",
+                (self.me, r, message, reply_to, now, json.dumps(files) if files else None),
             )
             ids.append(f"#{cur.lastrowid} -> {r}")
-        return "Sent " + ", ".join(ids) if ids else "No other peers to send to."
+        sent = "Sent " + ", ".join(ids) if ids else "No other peers to send to."
+        return sent + (f" with {len(files)} image(s)." if files and ids else "")
 
     def inbox(self):
         rows = take_unread(self.db, self.me)
@@ -194,7 +230,9 @@ class Bridge:
             q += " AND (sender = ? OR recipient = ?)"
             args += [peer, peer]
         rows = self.db.execute(q + " ORDER BY id DESC LIMIT ?", (*args, int(limit))).fetchall()
-        lines = [f"#{r['id']} {r['sender']} -> {r['recipient']} ({ago(r['created'])}): {r['body']}" for r in reversed(rows)]
+        lines = [f"#{r['id']} {r['sender']} -> {r['recipient']} ({ago(r['created'])}): {r['body']}"
+                 + (f" [images: {', '.join(json.loads(r['attachments']))}]" if r["attachments"] else "")
+                 for r in reversed(rows)]
         return "\n".join(lines) or "No messages yet."
 
     def note_set(self, key, value):
@@ -234,9 +272,13 @@ TOOLS = [
      schema({"summary": STR}, ["summary"]), lambda b, a: b.describe(a["summary"])),
     ("send", "Post a message in the shared #everyone channel, @mentioning another session by peer name; that session is "
              "woken to handle it and the user sees it in the channel. '*' addresses every session. Use reply_to with a "
-             "message id when answering.",
-     schema({"to": STR, "message": STR, "reply_to": INT}, ["to", "message"]),
-     lambda b, a: b.send(a["to"], a["message"], a.get("reply_to"))),
+             "message id when answering. Attach screenshots or diagrams with `attachments` when they add context.",
+     schema({"to": STR, "message": STR, "reply_to": INT,
+             "attachments": {"type": "array", "items": STR,
+                             "description": f"Paths of image files (PNG, JPG, GIF, WebP; up to {MAX_ATTACHMENTS}, "
+                                            f"{MAX_ATTACHMENT_BYTES // 2**20} MB each) to attach."}},
+            ["to", "message"]),
+     lambda b, a: b.send(a["to"], a["message"], a.get("reply_to"), a.get("attachments"))),
     ("inbox", "Read (and mark read) new messages sent to this session.",
      schema({}), lambda b, a: b.inbox()),
     ("wait", "Block until a new message arrives (optionally only a reply to a given message id), up to timeout seconds (default 120, max 600).",
@@ -256,7 +298,8 @@ INSTRUCTIONS = (
     "answer about its code, a port, a contract), don't guess or edit its files: find its owner with `peers` "
     "and ask it with `send`, giving full context, since it knows nothing about your task. When your change "
     "affects another project, tell its owner exactly what changed and what to do. When asked, do the work "
-    "and reply with `send` and reply_to. Everything you `send` is posted in #everyone, where the user "
+    "and reply with `send` and reply_to. Attach screenshots or diagrams (`attachments`) when they add context, "
+    "and open images you receive with the Read tool. Everything you `send` is posted in #everyone, where the user "
     "follows along. Messages from 'human' are the user: answer in your response, it is relayed to them."
 )
 
@@ -286,7 +329,11 @@ endpoint, schema, version), a test run, or a review. Don't guess, stub it out or
    - **Your side:** what you've already changed or will change, so the two sides match.
    - **Done when:** how they'll know it's right (tests, a command to run, expected output).
    - **What you need back:** a confirmation, a value, or a short report.
-4. If you can't continue without the answer, tell the user you're waiting on that session. Then use
+4. Attach images when they help. If a picture explains it better (a screenshot of the UI or the bug,
+   an error dialog, rendered output, a diagram or mockup), save it as a PNG, JPG, GIF or WebP file and pass
+   its path in `send`'s `attachments` (up to 5 images, 10 MB each). Still say in words what the image shows
+   and what to look at: the image adds context, it doesn't replace the written request.
+5. If you can't continue without the answer, tell the user you're waiting on that session. Then use
    `wait` with reply_to = your message id, or carry on with other work and pick the reply up when it arrives.
 
 ## When your change affects other projects
@@ -294,7 +341,7 @@ After finishing your part, `send` each affected session what changed (with the f
 what it must do. Record durable cross-project facts (API shapes, ports, env vars) with `note_set`.
 
 ## When another session asks you
-Do the work in your project, then reply with `send` and reply_to = their message id: what you changed,
+If the message lists attached images, open each one with the Read tool before acting. Do the work in your project, then reply with `send` and reply_to = their message id: what you changed,
 how you verified it, and anything they must do next. If something's unclear, ask them rather than guess.
 Don't reply to pure acknowledgements or reports that need nothing from you, so conversations end.
 
@@ -518,6 +565,8 @@ def gui_state(since):
         messages = [dict(r) for r in db.execute(
             "SELECT * FROM (SELECT * FROM messages WHERE id > ? ORDER BY id DESC LIMIT 500) ORDER BY id", (since,)
         )]
+        for m in messages:
+            m["attachments"] = [os.path.basename(f) for f in json.loads(m["attachments"] or "[]")]
         unread = [r["id"] for r in db.execute("SELECT id FROM messages WHERE read_at IS NULL")]
         notes = [dict(r) for r in db.execute("SELECT * FROM notes ORDER BY key")]
         return {"now": time.time(), "peers": peers, "messages": messages, "unread": unread, "notes": notes}
@@ -574,6 +623,8 @@ def gui(port=8765, open_browser=True):
 
         def do_GET(self):
             url = urllib.parse.urlsplit(self.path)
+            if url.path.startswith("/files/"):
+                return self.send_attachment(url)
             if not self.allowed(url.path.startswith("/api/")):
                 return self.respond(403, {"error": "forbidden"})
             if url.path == "/":
@@ -585,6 +636,26 @@ def gui(port=8765, open_browser=True):
                     return self.respond(400, {"error": "bad since"})
                 return self.respond(200, gui_state(since))
             self.respond(404, {"error": "not found"})
+
+        def send_attachment(self, url):
+            # <img> can't send headers, so the token comes in the query string here
+            t = urllib.parse.parse_qs(url.query).get("t", [""])[0]
+            if self.headers.get("Host") not in hosts or not secrets.compare_digest(t, token):
+                return self.respond(403, {"error": "forbidden"})
+            name = urllib.parse.unquote(url.path[len("/files/"):])
+            path = os.path.join(FILES_DIR, name)
+            ctype = IMAGE_TYPES.get(os.path.splitext(name)[1].lower())
+            if name != os.path.basename(name) or not ctype or not os.path.isfile(path):
+                return self.respond(404, {"error": "not found"})
+            with open(path, "rb") as f:
+                body = f.read()
+            self.send_response(200)
+            self.send_header("Content-Type", ctype)
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "private, max-age=86400, immutable")
+            self.send_header("X-Content-Type-Options", "nosniff")
+            self.end_headers()
+            self.wfile.write(body)
 
         def do_POST(self):
             if not self.allowed(True):
@@ -705,6 +776,8 @@ header .topic { color: var(--muted); font-size: 14px; overflow: hidden; text-ove
 .msg .name { font-weight: 600; color: var(--strong); }
 .msg .time { font-size: 12px; color: var(--muted); }
 .msg .text { white-space: pre-wrap; word-wrap: break-word; }
+.atts { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 6px; }
+.atts img { display: block; max-width: min(360px, 100%); max-height: 260px; border-radius: 8px; border: 1px solid var(--line); }
 .mention { background: var(--mention); color: var(--mention-text); border-radius: 4px; padding: 0 3px; font-weight: 600; }
 .msg .state { font-size: 12px; color: var(--muted); margin-top: 2px; }
 form { padding: 0 16px 20px; position: relative; }
@@ -813,7 +886,8 @@ function groups() {
         && Math.abs(g.created - m.created) < 2 && !g.rows.some(r => r.recipient === m.recipient)) {
       g.rows.push(m);
     } else {
-      out.push({sender: m.sender, body: m.body, created: m.created, reply_to: m.reply_to, channel: !!m.channel, rows: [m]});
+      out.push({sender: m.sender, body: m.body, created: m.created, reply_to: m.reply_to, channel: !!m.channel,
+                attachments: m.attachments || [], rows: [m]});
     }
   }
   for (const g of out) g.everyone = g.rows.length > 1;
@@ -961,6 +1035,23 @@ function renderLog(all) {
     for (const t of dm ? [] : targets(g)) text.append(el("span", "mention", "@" + t), " ");
     text.append(...withMentions(g.body));
     c.append(text);
+    if (g.attachments.length) {
+      const atts = el("div", "atts");
+      for (const name of g.attachments) {
+        const url = "/files/" + encodeURIComponent(name) + "?t=" + encodeURIComponent(TOKEN);
+        const a = el("a");
+        a.href = url;
+        a.target = "_blank";
+        const img = el("img");
+        img.src = url;
+        img.alt = name.replace(/^[0-9a-f]{12}-/, "");
+        img.title = img.alt;
+        img.onload = () => { if (atBottom) log.scrollTop = log.scrollHeight; };
+        a.append(img);
+        atts.append(a);
+      }
+      c.append(atts);
+    }
     const waiting = g.rows.filter(r => unread.has(r.id) && r.recipient !== "human").map(r => r.recipient);
     if (waiting.length) c.append(el("div", "state", "⏳ Waiting for " + waiting.join(", ") + " to pick this up"));
     d.append(c);
