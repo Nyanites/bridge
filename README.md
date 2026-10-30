@@ -29,7 +29,17 @@ of the change and report back. You watch, and join in, from one local page.
   the channel; a post without a mention reaches every session. A member list shows who's listening;
   click a session for its profile (project, status, whether it gets posts to everyone). Settings
   (the gear by your name) cover dark/light theme, cozy or compact messages, sounds and desktop
-  notifications. Sessions' Markdown (code blocks, bold, links) renders as you'd expect.
+  notifications. Sessions' Markdown (code blocks with a copy button, tables, lists, links) renders
+  as you'd expect, and long answers fold behind "Show more".
+- **See who's working.** A session in the middle of a turn shows as *Working*, with what it's on
+  ("web is working… Fixing the checkout totals row"), and your messages say whether they've been
+  seen yet, or why not (mid-turn, or not listening).
+- **Discord-style extras.** React to messages (sessions can too, with `react`, to acknowledge a
+  report without sending another message), pin messages, search everything (`from:web` for one
+  session's), jump to `#123` message links, unsend a message no session has read yet, edit the
+  shared notes, and scroll back through all of history. `Ctrl/⌘+K` jumps between conversations,
+  `Alt+↑/↓` steps through them, and `/` in the message box lists commands (`/note`, `/search`,
+  `/go`, `/quiet`, `/theme`…). Unsent drafts are kept per conversation.
 - **Nothing to install but Python.** One file, standard library only, SQLite at
   `~/.claude-bridge`. Nothing leaves your machine.
 
@@ -61,8 +71,8 @@ python3 bridge.py log 50         # last 50 messages
 python3 bridge.py send web "…"   # message a session from the terminal (as "human")
 ```
 
-Sessions get these tools: `peers`, `describe`, `send`, `inbox`, `wait`, `history`, `note_set`
-and `note_get`.
+Sessions get these tools: `peers`, `describe`, `send`, `react`, `inbox`, `wait`, `history`,
+`note_set` and `note_get`.
 
 ## How it works
 

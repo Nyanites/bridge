@@ -64,7 +64,15 @@ CREATE TABLE IF NOT EXISTS notes (
     updated_by TEXT NOT NULL,
     updated REAL NOT NULL
 );
+CREATE TABLE IF NOT EXISTS reactions (
+    message_id INTEGER NOT NULL,
+    who TEXT NOT NULL,
+    emoji TEXT NOT NULL,
+    created REAL NOT NULL,
+    PRIMARY KEY (message_id, who, emoji)
+);
 """
+BUSY_TTL = 30 * 60  # a turn the Stop hook never closed (you interrupted it, say) stops counting as working after this
 
 
 def connect():
@@ -82,6 +90,13 @@ def connect():
         "ALTER TABLE messages ADD COLUMN attachments TEXT",
         # 1 when the session skips messages to everyone (broadcasts, posts without @mentions)
         "ALTER TABLE peers ADD COLUMN quiet INTEGER NOT NULL DEFAULT 0",
+        # when the session's current turn started (NULL when it's idle), and what the turn is about
+        "ALTER TABLE peers ADD COLUMN busy_since REAL",
+        "ALTER TABLE peers ADD COLUMN activity TEXT",
+        # when the human pinned it in the GUI
+        "ALTER TABLE messages ADD COLUMN pinned REAL",
+        # when the human unsent it (only possible before any session read it)
+        "ALTER TABLE messages ADD COLUMN deleted REAL",
     ):
         try:
             db.execute(migration)
@@ -120,6 +135,40 @@ def register(db, cwd, exact=False):
 
 def touch(db, name):
     db.execute("UPDATE peers SET last_seen = ? WHERE name = ?", (time.time(), name))
+
+
+def set_busy(db, name, activity):
+    """Mark a session as mid-turn, with a line on what it's doing, or as idle again when activity is None."""
+    if activity is None:
+        db.execute("UPDATE peers SET busy_since = NULL, activity = NULL WHERE name = ?", (name,))
+        return
+    now = time.time()
+    db.execute(  # a turn that's still going keeps its start time
+        "UPDATE peers SET busy_since = CASE WHEN busy_since > ? THEN busy_since ELSE ? END, activity = ? WHERE name = ?",
+        (now - BUSY_TTL, now, " ".join(activity.split())[:200], name),
+    )
+
+
+def add_reaction(db, message_id, who, emoji):
+    emoji = str(emoji).strip()
+    if not emoji or len(emoji) > 16 or any(c.isspace() for c in emoji):
+        raise ValueError("A reaction is one emoji, like 👍 or ✅.")
+    if not db.execute("SELECT 1 FROM messages WHERE id = ? AND deleted IS NULL", (message_id,)).fetchone():
+        raise ValueError(f"No message #{message_id}.")
+    db.execute("INSERT OR IGNORE INTO reactions (message_id, who, emoji, created) VALUES (?, ?, ?, ?)",
+               (message_id, who, emoji, time.time()))
+
+
+def save_note(db, key, value, who):
+    if value == "":
+        db.execute("DELETE FROM notes WHERE key = ?", (key,))
+        return f"Deleted note '{key}'."
+    db.execute(
+        "INSERT INTO notes (key, value, updated_by, updated) VALUES (?, ?, ?, ?) "
+        "ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_by = excluded.updated_by, updated = excluded.updated",
+        (key, value, who, time.time()),
+    )
+    return f"Saved note '{key}'."
 
 
 def ago(ts):
@@ -202,17 +251,24 @@ def store_uploads(images):
 
 
 def take_unread(db, name):
-    rows = db.execute(
-        "SELECT * FROM messages WHERE recipient = ? AND read_at IS NULL ORDER BY id", (name,)
-    ).fetchall()
-    if rows:
-        db.execute(
-            f"UPDATE messages SET read_at = ? WHERE id IN ({','.join('?' * len(rows))})",
-            (time.time(), *[r["id"] for r in rows]),
-        )
-        human = [r["id"] for r in rows if r["sender"] == "human"]
-        if human:
-            db.execute("UPDATE peers SET pending_human = ? WHERE name = ?", (max(human), name))
+    q = "SELECT * FROM messages WHERE recipient = ? AND read_at IS NULL ORDER BY id"
+    if not db.execute(q, (name,)).fetchone():  # the cheap check the listener makes every second
+        return []
+    db.execute("BEGIN IMMEDIATE")  # so the human can't unsend a message while it's being picked up
+    try:
+        rows = db.execute(q, (name,)).fetchall()
+        if rows:
+            db.execute(
+                f"UPDATE messages SET read_at = ? WHERE id IN ({','.join('?' * len(rows))})",
+                (time.time(), *[r["id"] for r in rows]),
+            )
+            human = [r["id"] for r in rows if r["sender"] == "human"]
+            if human:
+                db.execute("UPDATE peers SET pending_human = ? WHERE name = ?", (max(human), name))
+        db.execute("COMMIT")
+    except BaseException:
+        db.execute("ROLLBACK")
+        raise
     return rows
 
 
@@ -278,7 +334,7 @@ class Bridge:
         return f"No reply within {timeout}s. The other session only sees messages when it is working or prompted."
 
     def history(self, peer=None, limit=20):
-        q, args = "SELECT * FROM messages WHERE (sender = ? OR recipient = ?)", [self.me, self.me]
+        q, args = "SELECT * FROM messages WHERE (sender = ? OR recipient = ?) AND deleted IS NULL", [self.me, self.me]
         if peer:
             q += " AND (sender = ? OR recipient = ?)"
             args += [peer, peer]
@@ -288,16 +344,12 @@ class Bridge:
                  for r in reversed(rows)]
         return "\n".join(lines) or "No messages yet."
 
+    def react(self, message_id, emoji):
+        add_reaction(self.db, int(message_id), self.me, emoji)
+        return f"Reacted {emoji.strip()} to #{message_id}."
+
     def note_set(self, key, value):
-        if value == "":
-            self.db.execute("DELETE FROM notes WHERE key = ?", (key,))
-            return f"Deleted note '{key}'."
-        self.db.execute(
-            "INSERT INTO notes (key, value, updated_by, updated) VALUES (?, ?, ?, ?) "
-            "ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_by = excluded.updated_by, updated = excluded.updated",
-            (key, value, self.me, time.time()),
-        )
-        return f"Saved note '{key}'."
+        return save_note(self.db, key, value, self.me)
 
     def note_get(self, key=None):
         if key:
@@ -331,6 +383,9 @@ TOOLS = [
                                             f"{MAX_ATTACHMENT_BYTES // 2**20} MB each) to attach."}},
             ["to", "message"]),
      lambda b, a: b.send(a["to"], a["message"], a.get("reply_to"), a.get("attachments"))),
+    ("react", "React to a message with one emoji instead of replying: 👍 got it, 👀 on it, ✅ done, ❌ can't. It doesn't "
+              "wake anyone, so use it to acknowledge a report or answer that needs nothing more.",
+     schema({"message_id": INT, "emoji": STR}, ["message_id", "emoji"]), lambda b, a: b.react(a["message_id"], a["emoji"])),
     ("inbox", "Read (and mark read) new messages sent to this session.",
      schema({}), lambda b, a: b.inbox()),
     ("wait", "Block until a new message arrives (optionally only a reply to a given message id), up to timeout seconds (default 120, max 600).",
@@ -350,8 +405,8 @@ INSTRUCTIONS = (
     "answer about its code, a port, a contract), don't guess or edit its files: find its owner with `peers` "
     "and ask it with `send`, giving full context, since it knows nothing about your task. When your change "
     "affects another project, tell its owner exactly what changed and what to do. When asked, do the work "
-    "and reply with `send` and reply_to. Attach screenshots or diagrams (`attachments`) when they add context, "
-    "and open images you receive with the Read tool. Everything you `send` is posted in #everyone, where the user "
+    "and reply with `send` and reply_to; acknowledge what needs no answer with `react` (👍) instead. Attach "
+    "screenshots or diagrams (`attachments`) when they add context, and open images you receive with the Read tool. Everything you `send` is posted in #everyone, where the user "
     "follows along. Messages from 'human' are the user: answer in your response, it is relayed to them."
 )
 
@@ -396,7 +451,8 @@ what it must do. Record durable cross-project facts (API shapes, ports, env vars
 ## When another session asks you
 If the message lists attached images, open each one with the Read tool before acting. Do the work in your project, then reply with `send` and reply_to = their message id: what you changed,
 how you verified it, and anything they must do next. If something's unclear, ask them rather than guess.
-Don't reply to pure acknowledgements or reports that need nothing from you, so conversations end.
+Don't reply to pure acknowledgements or reports that need nothing from you, so conversations end. To show
+you've seen one, react to it instead (`react` with 👍, or ✅ when it reports something done): that doesn't wake anyone.
 
 ## Messages from the user ('human')
 These come from the Bridge GUI, either privately to you or in #everyone. Answer in your normal response;
@@ -414,7 +470,8 @@ start it again. {describe}"""
 INBOUND_HINT = (
     "Handle each message as the owner of this project: if it is a task, do it and tell the user what "
     "you did; then reply to the sender with `send` (reply_to=<id>) with a short report or answer. "
-    "If it is just a report or acknowledgement needing nothing from you, don't reply; summarise it for the user. "
+    "If it is just a report or acknowledgement needing nothing from you, don't reply (`react` with 👍 if you like); "
+    "summarise it for the user. "
     "Messages from 'human' are the user writing from the bridge GUI, either privately to you or in #everyone: "
     "your final response is relayed back to where they wrote automatically, so answer in your response instead "
     "of `send`ing to human. If another "
@@ -528,6 +585,7 @@ def listen():
         touch(db, me)
         rows = take_unread(db, me)
         if rows:
+            set_busy(db, me, reading(rows))  # printing this wakes the session
             print(render_inbound(me, rows))
             print(restart_hint())
             return
@@ -539,15 +597,27 @@ def hook():
     data = hook_input()
     db = connect()
     me = register(db, data.get("cwd") or os.getcwd())
+    prompt = next((line for line in str(data.get("prompt") or "").splitlines() if line.strip()), "")
+    set_busy(db, me, prompt or "Working on a prompt")
     rows = take_unread(db, me)
     if rows:
         print(render_inbound(me, rows))
+
+
+def reading(rows):
+    senders = list(dict.fromkeys(display_name(r["sender"]) for r in rows))
+    return "Reading " + ("a message" if len(rows) == 1 else "messages") + " from " + ", ".join(senders)
+
+
+def display_name(name):
+    return "you" if name == "human" else name
 
 
 def session_start():
     data = hook_input()
     db = connect()
     me = register(db, data.get("cwd") or os.getcwd(), exact=True)
+    set_busy(db, me, None)
     rows = db.execute("SELECT * FROM peers ORDER BY name").fetchall()
     others = [f"- **{r['name']}**: {r['cwd']}" + (f" ({r['summary']})" if r["summary"] else "")
               for r in rows if r["name"] != me]
@@ -619,31 +689,102 @@ def stop():
     rows = take_unread(db, me)
     if rows:
         reason = render_inbound(me, rows)
+        set_busy(db, me, reading(rows))
     elif not listener_alive(db, me) and not data.get("stop_hook_active"):
         reason = f"The bridge listener is not running. Run `{LISTEN_CMD}` with the Bash tool, run_in_background=true, then stop."
     else:
+        set_busy(db, me, None)  # the turn is over
         return
     print(json.dumps({"decision": "block", "reason": reason}))
 
 
 # --- GUI -----------------------------------------------------------------------
 
-def gui_state(since):
+def wire(r):
+    """A message row as the GUI gets it: attachments by file name only."""
+    m = dict(r)
+    m["attachments"] = [os.path.basename(f) for f in json.loads(m["attachments"] or "[]")]
+    return m
+
+
+def gui_state(since, first=0):
+    """Messages after `since`, plus everything that can change on messages the page already has (id >= `first`):
+    reactions, pins and unsent ones."""
     db = connect()
     try:
+        now = time.time()
+        sent = dict(db.execute(  # a message to several sessions is one row each, all with the same timestamp
+            "SELECT sender, COUNT(DISTINCT created) FROM messages WHERE deleted IS NULL GROUP BY sender").fetchall())
         peers = [
             {"name": r["name"], "cwd": r["cwd"], "summary": r["summary"], "last_seen": r["last_seen"],
-             "listening": listener_alive(db, r["name"]), "quiet": bool(r["quiet"])}
+             "listening": listener_alive(db, r["name"]), "quiet": bool(r["quiet"]), "sent": sent.get(r["name"], 0),
+             "busy_since": r["busy_since"] if r["busy_since"] and now - r["busy_since"] < BUSY_TTL else None,
+             "activity": r["activity"] or ""}
             for r in db.execute("SELECT * FROM peers ORDER BY name").fetchall()
         ]
-        messages = [dict(r) for r in db.execute(
-            "SELECT * FROM (SELECT * FROM messages WHERE id > ? ORDER BY id DESC LIMIT 500) ORDER BY id", (since,)
+        messages = [wire(r) for r in db.execute(
+            "SELECT * FROM (SELECT * FROM messages WHERE id > ? AND deleted IS NULL ORDER BY id DESC LIMIT 500) ORDER BY id",
+            (since,)
         )]
-        for m in messages:
-            m["attachments"] = [os.path.basename(f) for f in json.loads(m["attachments"] or "[]")]
         unread = [r["id"] for r in db.execute("SELECT id FROM messages WHERE read_at IS NULL")]
         notes = [dict(r) for r in db.execute("SELECT * FROM notes ORDER BY key")]
-        return {"now": time.time(), "peers": peers, "messages": messages, "unread": unread, "notes": notes}
+        reactions = [dict(r) for r in db.execute(
+            "SELECT message_id, who, emoji FROM reactions WHERE message_id >= ? ORDER BY created", (first,))]
+        pins = [[r["id"], r["pinned"]] for r in db.execute(  # all of them, so the page can load older pinned ones
+            "SELECT id, pinned FROM messages WHERE pinned IS NOT NULL AND deleted IS NULL")]
+        deleted = [r["id"] for r in db.execute("SELECT id FROM messages WHERE deleted IS NOT NULL AND id >= ?", (first,))]
+        oldest = db.execute("SELECT MIN(id) FROM messages WHERE deleted IS NULL").fetchone()[0] or 0
+        return {"now": now, "peers": peers, "messages": messages, "unread": unread, "notes": notes,
+                "reactions": reactions, "pins": pins, "deleted": deleted, "oldest": oldest}
+    finally:
+        db.close()
+
+
+def gui_older(before, until=None):
+    """Earlier history: the 300 messages before `before`, or all of them back to `until` (for jumping to an old one)."""
+    db = connect()
+    try:
+        if until:
+            rows = db.execute("SELECT * FROM messages WHERE id < ? AND id >= ? AND deleted IS NULL ORDER BY id LIMIT 5000",
+                              (before, until))
+        else:
+            rows = db.execute("SELECT * FROM (SELECT * FROM messages WHERE id < ? AND deleted IS NULL "
+                              "ORDER BY id DESC LIMIT 300) ORDER BY id", (before,))
+        return {"messages": [wire(r) for r in rows]}
+    finally:
+        db.close()
+
+
+def gui_search(query, limit=50):
+    """Messages containing every word of `query` (from:NAME limits it to one sender), newest first,
+    with a message to several sessions counted once."""
+    words, sender = [], None
+    for w in query.split():
+        if w.lower().startswith("from:") and len(w) > 5:
+            sender = w[5:].lstrip("@")
+            sender = "human" if sender.lower() in ("me", "you", "human") else sender
+        else:
+            words.append(w)
+    if not words and not sender:
+        return {"results": [], "total": 0}
+    sql, args = "SELECT * FROM messages WHERE deleted IS NULL", []
+    for w in words:
+        sql += " AND body LIKE ? ESCAPE '\\'"
+        args.append("%" + w.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%")
+    if sender:
+        sql += " AND sender = ?"
+        args.append(sender)
+    db = connect()
+    try:
+        posts = {}
+        for r in db.execute(sql + " ORDER BY id DESC LIMIT 2000", args):
+            key = (r["sender"], r["created"], r["body"])
+            if key in posts:
+                posts[key]["to"].append(r["recipient"])
+            else:
+                posts[key] = {**wire(r), "to": [r["recipient"]]}
+        results = list(posts.values())
+        return {"results": results[:limit], "total": len(results)}
     finally:
         db.close()
 
@@ -687,6 +828,91 @@ def set_quiet(name, quiet):
         db.close()
 
 
+def ids_of(data):
+    ids = data.get("ids")
+    if not isinstance(ids, list) or not 0 < len(ids) <= 100:
+        raise ValueError("Bad ids")
+    return [int(i) for i in ids]
+
+
+def gui_react(ids, emoji, on):
+    """Add your reaction to a post (stored on its first row) or take it back (from any of its rows)."""
+    db = connect()
+    try:
+        if on:
+            add_reaction(db, ids[0], "human", emoji)
+        else:
+            db.execute(f"DELETE FROM reactions WHERE who = 'human' AND emoji = ? AND message_id IN ({','.join('?' * len(ids))})",
+                       (emoji, *ids))
+    finally:
+        db.close()
+
+
+def gui_pin(ids, pinned):
+    db = connect()
+    try:
+        db.execute(f"UPDATE messages SET pinned = ? WHERE id IN ({','.join('?' * len(ids))})",
+                   (time.time() if pinned else None, *ids))
+    finally:
+        db.close()
+
+
+def gui_unsend(ids):
+    """Take back your message, as long as no session has picked it up yet."""
+    db = connect()
+    try:
+        db.execute("BEGIN IMMEDIATE")  # take_unread can't pick it up halfway through this
+        try:
+            q = ",".join("?" * len(ids))
+            rows = db.execute(f"SELECT sender, read_at FROM messages WHERE id IN ({q}) AND deleted IS NULL", ids).fetchall()
+            if len(rows) != len(ids) or any(r["sender"] != "human" for r in rows):
+                raise ValueError("You can only unsend your own messages.")
+            if any(r["read_at"] for r in rows):
+                raise ValueError("Too late: a session has already read it.")
+            now = time.time()
+            db.execute(f"UPDATE messages SET deleted = ?, read_at = ? WHERE id IN ({q})", (now, now, *ids))
+            db.execute(f"DELETE FROM reactions WHERE message_id IN ({q})", ids)
+            db.execute("COMMIT")
+        except BaseException:
+            db.execute("ROLLBACK")
+            raise
+    finally:
+        db.close()
+
+
+def gui_note(key, value):
+    key = key.strip()
+    if not key or len(key) > 100:
+        raise ValueError("A note needs a short name.")
+    db = connect()
+    try:
+        save_note(db, key, value, "human")
+    finally:
+        db.close()
+
+
+def post_send(data):
+    to = data.get("to", "")
+    to = [str(t) for t in to] if isinstance(to, list) else str(to)
+    images = data.get("images") or []
+    if not isinstance(images, list) or not all(isinstance(i, dict) for i in images):
+        raise ValueError("Bad images")
+    reply_to = int(data["reply_to"]) if data.get("reply_to") else None
+    return {"ids": gui_send(to, str(data.get("body", "")), reply_to, bool(data.get("channel")), images,
+                            bool(data.get("everyone")))}
+
+
+# What the GUI page can do, by path; each takes the posted JSON object.
+POST_ROUTES = {
+    "/api/send": post_send,
+    "/api/quiet": lambda d: set_quiet(str(d.get("name", "")), bool(d.get("quiet"))),
+    "/api/react": lambda d: gui_react(ids_of(d), str(d.get("emoji", "")), bool(d.get("on"))),
+    "/api/pin": lambda d: gui_pin(ids_of(d), bool(d.get("pinned"))),
+    "/api/unsend": lambda d: gui_unsend(ids_of(d)),
+    "/api/note": lambda d: gui_note(str(d.get("key", "")), str(d.get("value", ""))),
+}
+
+
 def gui(port=8765, open_browser=True):
     import http.server
     import secrets
@@ -724,12 +950,16 @@ def gui(port=8765, open_browser=True):
                 return self.respond(403, {"error": "forbidden"})
             if url.path == "/":
                 return self.respond(200, page, "text/html; charset=utf-8")
-            if url.path == "/api/state":
-                try:
-                    since = int(urllib.parse.parse_qs(url.query).get("since", ["0"])[0])
-                except ValueError:
-                    return self.respond(400, {"error": "bad since"})
-                return self.respond(200, gui_state(since))
+            q = {k: v[0] for k, v in urllib.parse.parse_qs(url.query).items()}
+            try:
+                if url.path == "/api/state":
+                    return self.respond(200, gui_state(int(q.get("since", 0)), int(q.get("first", 0))))
+                if url.path == "/api/older":
+                    return self.respond(200, gui_older(int(q["before"]), int(q["until"]) if q.get("until") else None))
+                if url.path == "/api/search":
+                    return self.respond(200, gui_search(q.get("q", "")))
+            except (KeyError, ValueError):
+                return self.respond(400, {"error": "bad query"})
             self.respond(404, {"error": "not found"})
 
         def send_attachment(self, url):
@@ -755,28 +985,17 @@ def gui(port=8765, open_browser=True):
         def do_POST(self):
             if not self.allowed(True):
                 return self.respond(403, {"error": "forbidden"})
-            if self.path == "/api/quiet":
-                try:
-                    data = json.loads(self.rfile.read(int(self.headers.get("Content-Length") or 0)))
-                    set_quiet(str(data.get("name", "")), bool(data.get("quiet")))
-                except (ValueError, TypeError) as e:
-                    return self.respond(400, {"error": str(e)})
-                return self.respond(200, {"ok": True})
-            if self.path != "/api/send":
+            route = POST_ROUTES.get(self.path)
+            if not route:
                 return self.respond(404, {"error": "not found"})
             try:
                 data = json.loads(self.rfile.read(int(self.headers.get("Content-Length") or 0)))
-                to = data.get("to", "")
-                to = [str(t) for t in to] if isinstance(to, list) else str(to)
-                reply_to = int(data["reply_to"]) if data.get("reply_to") else None
-                images = data.get("images") or []
-                if not isinstance(images, list) or not all(isinstance(i, dict) for i in images):
-                    raise ValueError("Bad images")
-                ids = gui_send(to, str(data.get("body", "")), reply_to, bool(data.get("channel")), images,
-                               bool(data.get("everyone")))
-            except (ValueError, TypeError) as e:
+                if not isinstance(data, dict):
+                    raise ValueError("Bad request")
+                result = route(data)
+            except (ValueError, TypeError, KeyError) as e:
                 return self.respond(400, {"error": str(e)})
-            self.respond(200, {"ids": ids})
+            self.respond(200, result or {"ok": True})
 
     try:
         server = http.server.ThreadingHTTPServer(("127.0.0.1", port), Handler)
@@ -1185,6 +1404,124 @@ kbd { display: inline-block; min-width: 24px; padding: 2px 6px; border-radius: 4
 .toast.bad { background: var(--red); color: #fff; }
 .toast.out { opacity: 0; transform: translateY(6px); }
 
+/* working: a session in the middle of a turn */
+.st.busy, .dot.busy { background: var(--accent); animation: busy 1.6s ease-in-out infinite; }
+@keyframes busy { 50% { opacity: .45; } }
+.working { color: var(--accent); font-weight: 500; }
+.typing { display: inline-flex; align-items: center; gap: 6px; color: var(--text); }
+.typing b { font-weight: 700; color: var(--strong); }
+.typing .act { color: var(--muted); overflow: hidden; text-overflow: ellipsis; }
+.dots { display: inline-flex; gap: 3px; flex: none; }
+.dots i { width: 6px; height: 6px; border-radius: 50%; background: var(--text); animation: dot 1.4s infinite ease-in-out; }
+.dots i:nth-child(2) { animation-delay: .2s; }
+.dots i:nth-child(3) { animation-delay: .4s; }
+@keyframes dot { 0%, 70%, 100% { opacity: .25; transform: scale(.8); } 35% { opacity: 1; transform: none; } }
+@media (prefers-reduced-motion: reduce) { .st.busy, .dot.busy, .dots i { animation: none; } }
+.card-box .activity { font-style: italic; }
+
+/* reactions, pins, unsend */
+.reacts { display: flex; flex-wrap: wrap; align-items: center; gap: 4px; margin-top: 4px; }
+.react { display: inline-flex; align-items: center; gap: 6px; height: 24px; padding: 0 7px; border-radius: 8px;
+  border: 1px solid transparent; background: var(--side); cursor: pointer; font-size: 14px; }
+.react:hover { border-color: var(--sel); }
+.react.mine { background: var(--mention); border-color: var(--accent); }
+.react .n { font-size: 13px; font-weight: 600; color: var(--muted); }
+.react.mine .n { color: var(--mention-text); }
+.reacts .add-react { width: 28px; height: 24px; opacity: 0; }
+.msg:hover .reacts .add-react { opacity: 1; }
+.reacts .add-react .ic { width: 16px; height: 16px; }
+.meta .pin-ic { color: var(--muted); width: 14px; height: 14px; align-self: center; }
+.actions .ib.danger:hover, .actions .ib.armed { color: var(--red); }
+.actions .ib.armed { background: var(--hover); }
+#picker { position: fixed; z-index: 25; }
+.picker { display: grid; grid-template-columns: repeat(6, 36px); gap: 2px; padding: 8px; background: var(--card);
+  border-radius: 8px; box-shadow: var(--shadow); }
+.picker button { width: 36px; height: 36px; border: 0; border-radius: 6px; background: none; font-size: 20px; cursor: pointer; }
+.picker button:hover, .picker button.mine { background: var(--hover); }
+.picker .head { grid-column: 1 / -1; font-size: 12px; font-weight: 700; text-transform: uppercase; color: var(--muted); padding: 0 4px 4px; }
+
+/* richer Markdown */
+.codewrap { position: relative; }
+.codewrap .lang { position: absolute; right: 44px; top: 7px; font: 11px ui-monospace, SFMono-Regular, Menlo, monospace;
+  color: var(--faint); pointer-events: none; }
+.codewrap .codecopy { position: absolute; top: 4px; right: 4px; width: 28px; height: 28px; opacity: 0; background: var(--card); }
+.codewrap:hover .codecopy { opacity: 1; }
+.codewrap .codecopy .ic { width: 15px; height: 15px; }
+.text .li { position: relative; padding-left: calc(18px + var(--depth, 0) * 18px); }
+.text .li .mk { position: absolute; left: calc(var(--depth, 0) * 18px); width: 16px; color: var(--muted); }
+.text .li .mk.num { font-variant-numeric: tabular-nums; font-size: 13px; line-height: 21px; }
+.tablewrap { overflow-x: auto; margin: 6px 0; white-space: normal; }
+.text table { border-collapse: collapse; font-size: 14px; }
+.text th, .text td { border: 1px solid var(--line); padding: 4px 10px; text-align: left; vertical-align: top; white-space: pre-wrap; }
+.text th { background: var(--side); color: var(--strong); font-weight: 600; }
+.text a.msglink { color: var(--link); font-weight: 500; cursor: pointer; }
+.text.clamp { max-height: 340px; overflow: hidden; -webkit-mask-image: linear-gradient(#000 75%, transparent);
+  mask-image: linear-gradient(#000 75%, transparent); }
+.more { display: inline-flex; align-items: center; gap: 4px; margin-top: 2px; padding: 0; border: 0; background: none;
+  color: var(--link); font-size: 13px; font-weight: 600; cursor: pointer; }
+.more:hover { text-decoration: underline; }
+.more .ic { width: 14px; height: 14px; }
+.more.open .ic { transform: rotate(180deg); }
+mark { background: rgba(250, 166, 26, .35); color: inherit; border-radius: 2px; padding: 0 1px; }
+
+/* header search, popover panels */
+.search { position: relative; flex: none; margin-left: 4px; }
+.search input { width: 150px; height: 26px; padding: 0 28px 0 8px; border: 0; border-radius: 4px; background: var(--box);
+  color: var(--text); font-size: 14px; font-family: inherit; outline: 0; transition: width .15s; }
+.search input:focus, .search.has input { width: 240px; }
+.search .ic { position: absolute; right: 7px; top: 5px; width: 16px; height: 16px; color: var(--muted); pointer-events: none; }
+.pins-head .grow { flex: 1; }
+.pins-head .btn { flex: none; height: 28px; padding: 0 10px; font-size: 13px; }
+.hit { display: grid; grid-template-columns: 32px minmax(0, 1fr); gap: 4px 10px; margin-top: 8px; padding: 10px 12px; border-radius: 6px;
+  background: var(--main); border: 1px solid var(--line); cursor: pointer; --ring: var(--main); }
+.hit:hover { border-color: var(--sel); }
+.hit .avatar { --size: 32px; }
+.hit .hm { display: flex; align-items: baseline; gap: 6px; min-width: 0; font-size: 13px; }
+.hit .hm .name { font-size: 15px; }
+.hit .where { color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.hit .hb { grid-column: 2; font-size: 14px; white-space: pre-wrap; overflow-wrap: anywhere; display: -webkit-box;
+  -webkit-line-clamp: 5; -webkit-box-orient: vertical; overflow: hidden; }
+.hit .hx { margin-left: auto; }
+.hit .hx .ib { width: 24px; height: 24px; }
+.hit .hx .ic { width: 14px; height: 14px; }
+.panel-note { padding: 8px 4px 0; font-size: 12px; color: var(--muted); }
+.note .row { display: flex; align-items: center; gap: 4px; }
+.note .row b { flex: 1; min-width: 0; overflow-wrap: anywhere; }
+.note .row .ib { width: 26px; height: 26px; }
+.note .row .ic { width: 15px; height: 15px; }
+.note-form { margin-top: 8px; padding: 10px 12px; border-radius: 6px; background: var(--main); border: 1px solid var(--accent);
+  display: flex; flex-direction: column; gap: 8px; }
+.note-form input, .note-form textarea { width: 100%; padding: 6px 8px; border: 0; border-radius: 4px; background: var(--input);
+  color: var(--text); font: 13px/1.45 ui-monospace, SFMono-Regular, Menlo, monospace; outline: 0; resize: vertical; }
+.note-form textarea { min-height: 90px; height: auto; max-height: 40vh; }
+.note-form .bts { display: flex; justify-content: flex-end; gap: 8px; }
+.note-form .btn { flex: none; height: 30px; }
+
+/* history, jump to present */
+.older { display: flex; justify-content: center; padding: 16px 0 0; }
+.older .btn { flex: none; }
+.present { position: absolute; left: 16px; right: 16px; bottom: calc(100% - 8px); display: flex; align-items: center;
+  gap: 8px; padding: 6px 12px 14px; border-radius: 8px 8px 0 0; background: var(--accent); color: #fff; font-size: 13px;
+  font-weight: 500; border: 0; cursor: pointer; z-index: 2; }
+.present b { margin-left: auto; display: inline-flex; align-items: center; gap: 4px; font-weight: 700; }
+.present .ic { width: 16px; height: 16px; }
+
+/* quick switcher */
+.qs { width: min(560px, 100%); align-self: start; margin-top: 12vh; padding: 16px; border-radius: 8px; background: var(--side);
+  box-shadow: var(--shadow); --ring: var(--side); }
+.qs h3 { margin: 0 0 12px; font-size: 13px; color: var(--muted); font-weight: 500; }
+.qs input { width: 100%; height: 56px; padding: 0 14px; border: 0; border-radius: 6px; background: var(--box); color: var(--strong);
+  font-size: 20px; font-family: inherit; outline: 0; }
+.qs-list { margin-top: 10px; max-height: 50vh; overflow-y: auto; }
+.qs-item { display: flex; align-items: center; gap: 10px; padding: 7px 10px; border-radius: 4px; cursor: pointer; color: var(--muted); }
+.qs-item .avatar { --size: 24px; }
+.qs-item .hash { width: 24px; display: grid; place-items: center; }
+.qs-item b { color: var(--strong); font-weight: 500; }
+.qs-item .sub { margin-left: 4px; font-size: 13px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: 1; min-width: 0; }
+.qs-item.on { background: var(--sel); }
+.qs-tip { margin-top: 12px; font-size: 12px; color: var(--muted); }
+.qs-tip b { color: var(--accent); }
+
 @media (max-width: 1180px) { #members, #profile { display: none !important; } }
 @media (max-width: 820px) {
   .rail { display: none; }
@@ -1197,6 +1534,7 @@ kbd { display: inline-block; min-width: 24px; padding: 2px 6px; border-radius: 4
   .set-close { top: 12px; right: 12px; }
   .set-close span { display: none; }
 }
+@media (max-width: 700px) { .search { display: none; } }
 @media (max-width: 600px) {
   .app { flex-direction: column; }
   .side { width: auto; max-height: 38vh; }
@@ -1234,11 +1572,15 @@ kbd { display: inline-block; min-width: 24px; padding: 2px 6px; border-radius: 4
     <div class="body">
       <div class="center">
         <header class="bar"><span class="bar-icon" id="bar-icon"></span><span class="title" id="title"></span>
-          <span class="topic" id="topic"></span><div class="tools" id="tools"></div></header>
+          <span class="topic" id="topic"></span><div class="tools" id="tools"></div>
+          <label class="search pins-btn" id="search-box"><input id="search" placeholder="Search" aria-label="Search messages"
+            autocomplete="off"><i data-icon="search"></i></label></header>
         <div class="center-row">
           <div class="chat">
             <div class="log" id="log"></div>
             <form id="compose">
+              <button type="button" class="present" id="present" hidden>You're viewing older messages
+                <b>Jump to present <i data-icon="down"></i></b></button>
               <div class="mentions" hidden></div>
               <div class="pending"></div>
               <div class="box"><button type="button" class="attach" title="Attach images (or paste or drop them)"
@@ -1270,6 +1612,15 @@ kbd { display: inline-block; min-width: 24px; padding: 2px 6px; border-radius: 4
 </div>
 <div id="popout" hidden></div>
 <div id="pins" hidden></div>
+<div id="picker" hidden></div>
+<div class="modal" id="switcher" hidden>
+  <div class="qs" role="dialog" aria-modal="true" aria-label="Quick switcher">
+    <h3>Jump to a conversation</h3>
+    <input placeholder="Where would you like to go?" autocomplete="off">
+    <div class="qs-list"></div>
+    <div class="qs-tip"><b>Tip:</b> ↑ ↓ to pick, Enter to go, Esc to close. Alt + ↑ ↓ moves between conversations anywhere.</div>
+  </div>
+</div>
 <div class="modal" id="settings-modal" hidden>
   <div class="sheet" role="dialog" aria-modal="true" aria-label="Settings">
     <nav class="set-nav">
@@ -1294,13 +1645,18 @@ const CHANNEL = "#everyone";
 const $ = id => document.getElementById(id);
 let since = 0, view = CHANNEL, thread = null, peers = [], messages = [], notes = [];
 let unread = new Set(), skew = 0, notified = 0, drawn = "", connected = false, newMark = null;
+// reactions by message row id, pinned row ids (-> when), unsent row ids, the oldest message there is
+let reacts = new Map(), pins = new Map(), gone = new Set(), oldest = 0, extraSig = "";
+const expanded = new Set();  // long posts you opened up
+let drafts = {};  // unsent text per conversation ("t<root id>" for a thread)
+try { drafts = JSON.parse(localStorage.getItem("bridge.drafts")) || {}; } catch (e) {}
 const imgCache = new Map();  // reuse <img> elements across redraws so images don't flash
 let lastRead = {};  // view or "t<thread root id>" -> highest message id seen there (this browser only)
 try { lastRead = JSON.parse(localStorage.getItem("bridge.lastRead")) || {}; } catch (e) {}
 const firstVisit = !Object.keys(lastRead).length;
 // Per-browser preferences. Which sessions get posts to everyone is shared, so it lives on the server.
 const settings = {theme: "system", density: "cozy", desktop: true, sound: true, notifyAll: false, muted: false,
-                  members: true, profile: true, banner: true};
+                  members: true, profile: true, banner: true, collapse: true};
 try { Object.assign(settings, JSON.parse(localStorage.getItem("bridge.settings"))); } catch (e) {}
 {
   const h = decodeURIComponent(location.hash.slice(1));
@@ -1325,6 +1681,14 @@ const ICONS = {
   folder: "M4 20h16a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-7.9a2 2 0 0 1-1.69-.9L9.6 3.9A2 2 0 0 0 7.93 3H4a2 2 0 0 0-2 2v13a2 2 0 0 0 2 2z",
   eye: "M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7S2 12 2 12zM12 15a3 3 0 1 0 0-6 3 3 0 0 0 0 6z",
   info: "M12 22a10 10 0 1 0 0-20 10 10 0 0 0 0 20zM12 16v-4M12 8h.01",
+  pin: "M12 17v5M9 10.76a2 2 0 0 1-1.11 1.79l-1.78.9A2 2 0 0 0 5 15.24V16a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1v-.76a2 2 0 0 0-1.11-1.79l-1.78-.9A2 2 0 0 1 15 10.76V7a1 1 0 0 1 1-1 2 2 0 0 0 0-4H8a2 2 0 0 0 0 4 1 1 0 0 1 1 1z",
+  smile: "M22 11v1a10 10 0 1 1-9-10M8 14s1.5 2 4 2 4-2 4-2M9 9h.01M15 9h.01M16 5h6M19 2v6",
+  search: "M11 19a8 8 0 1 0 0-16 8 8 0 0 0 0 16zM21 21l-4.3-4.3",
+  trash: "M3 6h18M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2",
+  pencil: "M21.17 6.81a1 1 0 0 0-3.99-3.99L3.84 16.17a2 2 0 0 0-.5.83l-1.32 4.35a.5.5 0 0 0 .62.62l4.35-1.32a2 2 0 0 0 .83-.5zM15 5l4 4",
+  check: "M20 6 9 17l-5-5",
+  down: "M12 5v14M19 12l-7 7-7-7",
+  chevron: "m6 9 6 6 6-6",
 };
 const LOGO = '<svg viewBox="0 0 128 128" aria-hidden="true"><defs><linearGradient id="bridge-g" x1="0" y1="0" x2="1" y2="1">'
   + '<stop offset="0" stop-color="#8b5cf6"/><stop offset="1" stop-color="#5b21b6"/></linearGradient></defs>'
@@ -1396,16 +1760,25 @@ function ago(ts) {
   if (s < 86400) return Math.floor(s / 3600) + "h ago";
   return Math.floor(s / 86400) + "d ago";
 }
+function dur(ts) {
+  const s = Math.max(0, Math.floor(serverNow() - ts));
+  if (s < 60) return "under a minute";
+  if (s < 3600) return Math.floor(s / 60) + "m";
+  return Math.floor(s / 3600) + "h " + Math.floor(s % 3600 / 60) + "m";
+}
 const display = name => name === "human" ? "You" : name;
 const hue = name => { let h = 0; for (const c of name) h = (h * 31 + c.charCodeAt(0)) % 360; return h; };
 const peerOf = name => peers.find(p => p.name === name);
 // Online: its listener is running, so a message wakes it. Idle: seen lately, but messages wait for its next prompt.
+// Working: in the middle of a turn, so a new message waits until the turn ends.
 function presence(p) {
   if (!p) return "off";
+  if (p.busy_since) return "busy";
   if (p.listening) return "on";
   return serverNow() - p.last_seen < 900 ? "idle" : "off";
 }
-const PRESENCE = {on: ["Online", "Listening: a message wakes it right away"],
+const PRESENCE = {busy: ["Working", "In the middle of a turn: it picks up new messages when the turn ends"],
+                  on: ["Online", "Listening: a message wakes it right away"],
                   idle: ["Idle", "Not listening: messages wait for its next prompt"],
                   off: ["Offline", "Not seen in the last 15 minutes"]};
 function avatar(name, withStatus) {
@@ -1442,6 +1815,7 @@ async function api(path, body) {
   return data;
 }
 function save() { try { localStorage.setItem("bridge.lastRead", JSON.stringify(lastRead)); } catch (e) {} }
+function saveDrafts() { try { localStorage.setItem("bridge.drafts", JSON.stringify(drafts)); } catch (e) {} }
 function saveSettings() { try { localStorage.setItem("bridge.settings", JSON.stringify(settings)); } catch (e) {} }
 function applyAppearance() {
   if (settings.theme === "system") delete document.documentElement.dataset.theme;
@@ -1472,6 +1846,7 @@ function ping() {
 function groups() {
   const out = [];
   for (const m of messages) {
+    if (gone.has(m.id)) continue;
     const g = out[out.length - 1];
     if (g && g.sender === m.sender && g.body === m.body && g.channel === !!m.channel
         && Math.abs(g.created - m.created) < 2 && !g.rows.some(r => r.recipient === m.recipient)) {
@@ -1547,8 +1922,9 @@ function mentionEl(name) {
   const s = el("span", "mention", "@" + name);
   return name === "everyone" || name === "You" ? s : clickable(s, name);
 }
-// The bits of Markdown sessions write most: `code`, ```blocks```, **bold**, # headings, > quotes, links, @mentions.
-const INLINE = /(`[^`\n]+`)|(\*\*[^*\n]+?\*\*)|(https?:\/\/[^\s<>"']*[^\s<>"'.,;:!?)\]])|@([\w-]+(?:\.[\w-]+)*)/g;
+// The Markdown sessions write most: ```code``` (with a copy button), `code`, **bold**, # headings, > quotes,
+// - lists, | tables |, links, @mentions and #123 links to other messages.
+const INLINE = /(`[^`\n]+`)|(\*\*[^*\n]+?\*\*)|(https?:\/\/[^\s<>"']*[^\s<>"'.,;:!?)\]])|@([\w-]+(?:\.[\w-]+)*)|(?<![\w&#\/])#(\d{1,9})\b/g;
 function inline(text, names) {
   const out = [];
   let last = 0;
@@ -1561,33 +1937,83 @@ function inline(text, names) {
       node.href = m[3];
       node.target = "_blank";
       node.rel = "noopener noreferrer";
-    } else if (names.has(m[4])) node = mentionEl(m[4]);
-    else continue;
+    } else if (m[4]) {
+      if (!names.has(m[4])) continue;
+      node = mentionEl(m[4]);
+    } else {
+      const id = +m[5];
+      if (id < oldest || id > since) continue;  // not a message here
+      node = el("a", "msglink", "#" + id);
+      node.title = "Jump to message #" + id;
+      node.onclick = () => jump(id);
+    }
     out.push(text.slice(last, m.index), node);
     last = m.index + m[0].length;
   }
   out.push(text.slice(last));
   return out;
 }
+function codeBlock(lang, code) {
+  const w = el("div", "codewrap");
+  w.append(el("pre", null, code));
+  if (lang) w.append(el("span", "lang", lang));
+  w.append(iconBtn("copy", "Copy code", () => copy(code), "codecopy"));
+  return w;
+}
+// a table row's cells; \| is a literal pipe inside a cell
+const cells = line => line.trim().replace(/^\||(?<!\\)\|$/g, "").split(/(?<!\\)\|/).map(c => c.trim().replace(/\\\|/g, "|"));
+function table(rows, names) {
+  const t = el("table"), w = el("div", "tablewrap");
+  rows.forEach((r, i) => {
+    const tr = el("tr");
+    for (const c of cells(r)) {
+      const cell = el(i ? "td" : "th");
+      cell.append(...inline(c, names));
+      tr.append(cell);
+    }
+    t.append(tr);
+  });
+  w.append(t);
+  return w;
+}
 function rich(body) {
   const names = new Set([...peers.map(p => p.name), "everyone"]);
-  const parts = body.split(/```[\w+-]*\n?([\s\S]*?)```/), out = [];
-  parts.forEach((part, i) => {
-    if (i % 2) return out.push(el("pre", null, part.replace(/\n$/, "")));
+  const parts = body.split(/```([\w+-]*)[^\S\n]*\n?([\s\S]*?)```/), out = [];
+  for (let i = 0; i < parts.length; i += 3) {
+    let part = parts[i];
     if (i > 0) part = part.replace(/^\n/, "");
     if (i < parts.length - 1) part = part.replace(/\n$/, "");
     let buf = [];
     const flush = () => { if (buf.length) out.push(...inline(buf.join("\n"), names)); buf = []; };
-    for (const line of part.split("\n")) {
+    const lines = part.split("\n");
+    for (let j = 0; j < lines.length; j++) {
+      const line = lines[j];
+      if (/^\s*\|.*\|\s*$/.test(line) && /^\s*\|?\s*:?-{3,}/.test(lines[j + 1] || "")) {
+        flush();
+        const rows = [line];
+        for (j += 2; j < lines.length && /^\s*\|/.test(lines[j]); j++) rows.push(lines[j]);
+        j--;
+        out.push(table(rows, names));
+        continue;
+      }
       const h = line.match(/^(#{1,3})\s+(.*)$/), q = line.match(/^>\s?(.*)$/);
-      if (!h && !q) { buf.push(line); continue; }
+      const li = line.match(/^(\s*)([-*•]|\d{1,3}[.)])\s+(.*)$/);
+      if (!h && !q && !li) { buf.push(line); continue; }
       flush();
+      if (li) {
+        const d = el("div", "li"), num = /\d/.test(li[2]);
+        d.style.setProperty("--depth", Math.min(4, Math.floor(li[1].replace(/\t/g, "  ").length / 2)));
+        d.append(el("span", "mk" + (num ? " num" : ""), num ? li[2] : "•"), ...inline(li[3], names));
+        out.push(d);
+        continue;
+      }
       const d = el("div", h ? "h" + h[1].length : "quote");
       d.append(...inline(h ? h[2] : q[1], names));
       out.push(d);
     }
     flush();
-  });
+    if (i + 2 < parts.length) out.push(codeBlock(parts[i + 1], parts[i + 2].replace(/\n$/, "")));
+  }
   return out;
 }
 // who a channel post is for, minus anyone its text already @mentions
@@ -1604,7 +2030,11 @@ function sidebarItem(v, iconNode, label, sub, count, extra) {
   const d = el("div", "item" + (v === CHANNEL ? " ch" : "") + (view === v ? " active" : "") + (count ? " unread" : ""));
   const l = el("div", "label");
   l.append(el("div", null, label));
-  if (sub) l.append(el("div", "sub", sub));
+  if (sub) {
+    const d = el("div", "sub");
+    d.append(sub);
+    l.append(d);
+  }
   d.append(iconNode, l, ...(extra || []));
   if (count) d.append(el("span", "pill", count > 99 ? "99+" : String(count)));
   d.onclick = () => setView(v);
@@ -1626,8 +2056,8 @@ function renderSidebar(M) {
   $("dms").replaceChildren(...peers.map(p => {
     const n = view === p.name ? 0 : unreadDM(M, p.name);
     replies += n;
-    const item = sidebarItem(p.name, avatar(p.name, true), p.name, p.summary || PRESENCE[presence(p)][0], n,
-                             p.quiet ? [quietIcon(p)] : []);
+    const sub = p.busy_since ? el("span", "working", "Working…") : p.summary || PRESENCE[presence(p)][0];
+    const item = sidebarItem(p.name, avatar(p.name, true), p.name, sub, n, p.quiet ? [quietIcon(p)] : []);
     item.title = p.cwd + (p.summary ? "\n" + p.summary : "");
     return item;
   }));
@@ -1647,11 +2077,29 @@ function renderMe() {
   m.title = settings.muted ? "Notifications muted: click to unmute" : "Mute notifications";
   m.setAttribute("aria-label", m.title);
 }
+// "web is working…" under a send box, for the sessions in that conversation that are mid-turn
+const working = names => names.filter(n => peerOf(n) && peerOf(n).busy_since);
+const andList = names => names.length < 3 ? names.join(" and ") : names.slice(0, -1).join(", ") + " and " + names[names.length - 1];
+function setHint(form, text, busy) {
+  const hint = form.querySelector(".hint");
+  if (!busy.length) { hint.textContent = text; hint.title = ""; return; }
+  const t = el("span", "typing"), dots = el("span", "dots");
+  dots.append(el("i"), el("i"), el("i"));
+  const who = busy.length > 3 ? [el("b", null, busy.length + " sessions"), " are working…"]
+    : [...busy.flatMap((n, i) => [i ? (i === busy.length - 1 ? " and " : ", ") : "", el("b", null, n)]),
+       busy.length === 1 ? " is working…" : " are working…"];
+  t.append(dots, ...who);
+  const p = busy.length === 1 && peerOf(busy[0]);
+  if (p && p.activity) t.append(el("span", "act", " " + p.activity));
+  hint.replaceChildren(t);
+  hint.title = busy.map(n => n + ": " + (peerOf(n).activity || "working") + " (for " + dur(peerOf(n).busy_since) + ")").join("\n");
+}
 function renderBanner() {
   $("banner").hidden = !(settings.banner && settings.desktop && "Notification" in window && Notification.permission === "default");
 }
 
-// One message. opts: {M, log, stick, cont, chips, preview, threadKey (adds the thread summary and action)}
+// One message. opts: {M, log, stick, cont, chips, preview, receipt (say who's seen it),
+// threadKey (adds the thread summary and action)}
 function messageEl(g, opts) {
   const d = el("div", "msg" + (opts.cont ? " cont" : ""));
   d.dataset.ids = " " + g.rows.map(r => r.id).join(" ") + " ";
@@ -1664,19 +2112,29 @@ function messageEl(g, opts) {
   }
   d.append(clickable(avatar(g.sender), g.sender));
   if (opts.cont) d.append(el("span", "htime", clock(g.created)));
-  const c = el("div", "content");
+  const c = el("div", "content"), pinned = isPinned(g);
   if (!opts.cont) {
     const meta = el("div", "meta"), t = el("span", "time", settings.density === "compact" ? clock(g.created) : when(g.created));
-    t.title = new Date(g.created * 1000).toLocaleString();
+    t.title = new Date(g.created * 1000).toLocaleString() + " · #" + g.key;
     meta.append(nameEl(g.sender));
     if (g.sender !== "human") meta.append(aiTag());
     if (settings.density === "compact") meta.prepend(t); else meta.append(t);
+    if (pinned) meta.append(pinIcon());
     c.append(meta);
-  }
+  } else if (pinned) d.querySelector(".htime").after(pinIcon());
   const text = el("div", "text");
   for (const t of opts.chips ? targets(g) : []) text.append(mentionEl(t), " ");
   text.append(...rich(g.body));
   c.append(text);
+  const lines = g.body.split("\n").length;
+  if (settings.collapse && (g.body.length > 1800 || lines > 28)) {
+    const open = expanded.has(g.key), more = el("button", "more" + (open ? " open" : ""));
+    text.classList.toggle("clamp", !open);
+    more.type = "button";
+    more.append(open ? "Show less" : "Show more (" + lines + " lines)", icon("chevron"));
+    more.onclick = () => { open ? expanded.delete(g.key) : expanded.add(g.key); render(); };
+    c.append(more);
+  }
   if (g.attachments.length) {
     const atts = el("div", "atts");
     for (const file of g.attachments) {
@@ -1700,13 +2158,24 @@ function messageEl(g, opts) {
     }
     c.append(atts);
   }
-  const waiting = g.rows.filter(r => unread.has(r.id) && r.recipient !== "human").map(r => r.recipient);
-  if (waiting.length) {
-    const s = el("div", "state");
-    s.append(icon("clock"), "Waiting for " + waiting.join(", ") + " to pick this up");
-    c.append(s);
+  const rs = reactionsOf(g);
+  if (rs.size) {
+    const box = el("div", "reacts");
+    for (const [emoji, who] of rs) {
+      const mine = who.has("human"), b = el("button", "react" + (mine ? " mine" : ""));
+      b.type = "button";
+      b.title = andList([...who].map(display)) + " reacted with " + emoji;
+      b.append(el("span", null, emoji), el("span", "n", who.size));
+      b.onclick = () => react(g, emoji, !mine);
+      box.append(b);
+    }
+    box.append(iconBtn("smile", "Add reaction", ev => openPicker(g, ev.currentTarget), "add-react"));
+    c.append(box);
   }
+  const st = delivery(g, opts.receipt);
+  if (st) c.append(st);
   const acts = el("div", "actions");
+  acts.append(iconBtn("smile", "Add reaction", ev => openPicker(g, ev.currentTarget)));
   if (opts.threadKey) {
     const reps = opts.M.threads.get(opts.threadKey) || [];
     if (reps.length) {
@@ -1721,10 +2190,91 @@ function messageEl(g, opts) {
     }
     acts.append(iconBtn("thread", "Reply in thread", () => openThread(opts.threadKey)));
   }
+  acts.append(iconBtn("pin", pinned ? "Unpin" : "Pin message", () => pin(g, !pinned)));
   if (g.body) acts.append(iconBtn("copy", "Copy text", () => copy(g.body)));
+  if (g.sender === "human" && g.rows.every(r => unread.has(r.id))) {
+    acts.append(iconBtn("trash", "Unsend (no session has read it yet)", ev => unsend(g, ev.currentTarget), "danger"));
+  }
   d.append(acts, c);
   return d;
 }
+function pinIcon() {
+  const i = icon("pin", 14);
+  i.classList.add("pin-ic");
+  i.setAttribute("aria-label", "Pinned");
+  return i;
+}
+// Whether the sessions have picked it up: "waiting" while any hasn't, and on your latest post, who's seen it.
+function delivery(g, receipt) {
+  const to = g.rows.filter(r => r.recipient !== "human").map(r => r.recipient);
+  if (!to.length) return null;
+  const waiting = g.rows.filter(r => r.recipient !== "human" && unread.has(r.id)).map(r => r.recipient);
+  const s = el("div", "state");
+  if (waiting.length) {
+    const p = waiting.length === 1 && peerOf(waiting[0]);
+    const why = !p ? "" : p.busy_since ? " · it's mid-turn and will see it when that turn ends"
+      : p.listening ? "" : " · it isn't listening, so it'll see it on its next prompt";
+    s.append(icon("clock"), "Waiting for " + andList(waiting) + " to pick this up" + why);
+    return s;
+  }
+  if (!receipt || g.sender !== "human") return null;
+  const busy = working(to);
+  s.append(icon("check"), (to.length > 3 ? "Seen by " + to.length + " sessions" : "Seen by " + andList(to))
+           + (busy.length ? " · " + andList(busy) + (busy.length > 1 ? " are" : " is") + " working" : ""));
+  return s;
+}
+function reactionsOf(g) {
+  const by = new Map();
+  for (const r of g.rows) for (const x of reacts.get(r.id) || []) {
+    if (!by.has(x.emoji)) by.set(x.emoji, new Set());
+    by.get(x.emoji).add(x.who);
+  }
+  return by;
+}
+const isPinned = g => g.rows.some(r => pins.has(r.id));
+const idsOf = g => g.rows.map(r => r.id);
+async function react(g, emoji, on) {
+  try { await api("/api/react", {ids: idsOf(g), emoji, on}); poll(); }
+  catch (e) { toast("Couldn't react: " + e.message, true); }
+}
+async function pin(g, pinned) {
+  try { await api("/api/pin", {ids: idsOf(g), pinned}); toast(pinned ? "Pinned" : "Unpinned"); poll(); }
+  catch (e) { toast("Couldn't pin it: " + e.message, true); }
+}
+// The first click arms the button, a second one within a few seconds unsends.
+async function unsend(g, btn) {
+  if (!btn.classList.contains("armed")) {
+    btn.classList.add("armed");
+    btn.title = "Click again to unsend";
+    toast("Click the bin again to unsend it");
+    setTimeout(() => btn.classList.remove("armed"), 4000);
+    return;
+  }
+  try { await api("/api/unsend", {ids: idsOf(g)}); toast("Message unsent"); poll(); }
+  catch (e) { toast(e.message, true); }
+}
+const QUICK = ["👍", "✅", "👀", "❤️", "🎉", "🚀", "😂", "🤔", "🙏", "🔥", "⚠️", "❌"];
+let pickFor = null;
+function openPicker(g, anchor) {
+  const box = el("div", "picker"), mine = reactionsOf(g);
+  box.append(el("div", "head", "React"));
+  for (const e of QUICK) {
+    const on = mine.has(e) && mine.get(e).has("human"), b = el("button", on ? "mine" : null, e);
+    b.type = "button";
+    b.title = on ? "Remove your " + e : "React with " + e;
+    b.onclick = () => { closePicker(); react(g, e, !on); };
+    box.append(b);
+  }
+  const p = $("picker");
+  pickFor = g.key;
+  p.replaceChildren(box);
+  p.hidden = false;
+  let r = anchor.getBoundingClientRect();
+  if (!r.width) r = anchor.closest(".msg").getBoundingClientRect();  // the hover bar had already hidden
+  p.style.left = Math.max(8, Math.min(r.right - p.offsetWidth, innerWidth - p.offsetWidth - 8)) + "px";
+  p.style.top = (r.top - p.offsetHeight - 6 > 8 ? r.top - p.offsetHeight - 6 : r.bottom + 6) + "px";
+}
+function closePicker() { $("picker").hidden = true; pickFor = null; }
 async function copy(text) {
   try { await navigator.clipboard.writeText(text); toast("Copied to clipboard"); }
   catch (e) { toast("Couldn't copy: " + e.message, true); }
@@ -1740,6 +2290,7 @@ function renderList(log, items, opts, head) {
   const stick = opts.stick ?? log.scrollHeight - log.scrollTop - log.clientHeight < 60;
   const kids = [...head], compact = settings.density === "compact";
   let prev = null, lastDay = opts.after ? dayOf(opts.after.created) : null, marked = false;
+  const mine = [...items].reverse().find(g => g.sender === "human");  // your latest post says who's seen it
   for (const g of items) {
     const newDay = dayOf(g.created) !== lastDay;
     if (newDay) kids.push(dayDivider(g.created));
@@ -1753,7 +2304,7 @@ function renderList(log, items, opts, head) {
     }
     const cont = !compact && !newDay && !isNew && prev && prev.sender === g.sender && !(opts.preview && g.reply_to)
                  && g.created - prev.created < 300 && opts.view !== CHANNEL;
-    kids.push(messageEl(g, {...opts, log, stick, cont, threadKey: opts.view === CHANNEL ? g.key : null}));
+    kids.push(messageEl(g, {...opts, log, stick, cont, receipt: g === mine, threadKey: opts.view === CHANNEL ? g.key : null}));
     prev = g;
   }
   log.replaceChildren(...kids);
@@ -1781,7 +2332,23 @@ function renderMain(M) {
     intro.append(big, el("h2", null, "Welcome to #everyone"),
                  el("p", null, "Where the sessions talk to each other, and where you can talk to all of them. @mention a session to ask just that one. Replies collect in a thread under the post they answer."));
   }
-  renderList($("log"), dm ? dmItems(M, view) : M.roots, {M, view, chips: !dm, preview: true, mark: newMark.id}, [intro]);
+  // Older history loads on request; the intro only shows once you've reached the very first message.
+  const head = [intro];
+  if (messages.length && messages[0].id > oldest) {
+    const b = el("button", "btn"), wrap = el("div", "older");
+    b.type = "button";
+    b.append(icon("clock"), "Load earlier messages");
+    b.onclick = async () => {
+      const log = $("log"), h = log.scrollHeight, top = log.scrollTop;
+      b.disabled = true;
+      await loadOlder();
+      render();
+      log.scrollTop = top + log.scrollHeight - h;
+    };
+    wrap.append(b);
+    head[0] = wrap;
+  }
+  renderList($("log"), dm ? dmItems(M, view) : M.roots, {M, view, chips: !dm, preview: true, mark: newMark.id}, head);
 }
 
 function renderThread(M) {
@@ -1795,8 +2362,8 @@ function renderThread(M) {
                 el("div", "tdiv", reps.length ? reps.length + (reps.length === 1 ? " reply" : " replies") : "No replies yet")];
   renderList(log, reps, {M, chips: true, stick, after: root}, head);
   const who = threadPeople(M, root);
-  $("tcompose").querySelector(".hint").textContent =
-    (who.length ? "Goes to " + who.join(", ") : "Goes to every session") + " · @mention to bring in someone else";
+  setHint($("tcompose"), (who.length ? "Goes to " + who.join(", ") : "Goes to every session") + " · @mention to bring in someone else",
+          working(who));
   return true;
 }
 // sessions taking part in a thread; your thread replies go to them
@@ -1808,9 +2375,9 @@ function threadPeople(M, root) {
 }
 
 function renderMembers() {
-  const box = el("div", "members"), by = {on: [], idle: [], off: []};
+  const box = el("div", "members"), by = {busy: [], on: [], idle: [], off: []};
   for (const p of peers) by[presence(p)].push(p);
-  for (const k of ["on", "idle", "off"]) {
+  for (const k of ["busy", "on", "idle", "off"]) {
     if (!by[k].length) continue;
     box.append(el("div", "section", PRESENCE[k][0] + " — " + by[k].length));
     for (const p of by[k]) {
@@ -1819,7 +2386,7 @@ function renderMembers() {
       n.style.setProperty("--h", hue(p.name));
       n.style.color = `hsl(${hue(p.name)} 62% var(--name-l))`;
       top.append(n, " ", aiTag());
-      l.append(top, el("div", "sub", p.summary || PRESENCE[k][1]));
+      l.append(top, k === "busy" ? el("div", "sub working", p.activity || "Working…") : el("div", "sub", p.summary || PRESENCE[k][1]));
       m.append(avatar(p.name, true), l);
       if (p.quiet) m.append(quietIcon(p));
       m.title = p.cwd;
@@ -1846,11 +2413,14 @@ function profileCard(name, docked) {
     return card;
   }
   const s = presence(p), st = el("div", "card-status");
-  st.append(el("span", "dot " + s), PRESENCE[s][0] + " · " + (p.listening ? "listening" : "last seen " + ago(p.last_seen)));
+  st.append(el("span", "dot " + s), PRESENCE[s][0] + " · " + (p.busy_since ? "for " + dur(p.busy_since)
+            : p.listening ? "listening" : "last seen " + ago(p.last_seen)));
   st.title = PRESENCE[s][1];
   const info = el("div", "card-box");
+  if (p.busy_since) info.append(el("h4", null, "Working on"), el("p", "activity", p.activity || "Something"));
   info.append(el("h4", null, "About"), el("p", null, p.summary || "No description yet."),
-              el("h4", null, "Project"), el("p", "mono", p.cwd));
+              el("h4", null, "Project"), el("p", "mono", p.cwd),
+              el("h4", null, "Activity"), el("p", null, p.sent + (p.sent === 1 ? " message sent" : " messages sent")));
   const set = el("div", "card-box"), row = el("div", "setrow"), txt = el("div", "txt");
   txt.append(el("b", null, "Posts to everyone"),
              el("span", null, p.quiet ? "Skipped. Only an @mention reaches it." : "Gets posts in #everyone that don't @mention anyone."));
@@ -1896,30 +2466,177 @@ async function setQuiet(p, quiet) {
   }
 }
 
-function renderPins() {
-  const box = el("div", "pins"), head = el("div", "pins-head"), list = el("div", "pins-list");
-  head.append(icon("notes"), "Shared notes", el("span", null, "saved by sessions with note_set"));
-  for (const n of notes) {
-    const d = el("div", "note");
-    d.append(el("b", null, n.key), el("pre", null, n.value), el("div", "by", "Saved by " + n.updated_by + " · " + ago(n.updated)));
-    list.append(d);
-  }
-  if (!notes.length) {
-    const e = el("div", "empty");
-    e.append(icon("notes"), "No shared notes yet. Sessions save facts other projects need (ports, API shapes) here.");
-    list.append(e);
-  }
-  box.append(head, list);
-  $("pins").replaceChildren(box);
+// The popover under the header: pinned messages here, shared notes, or search results.
+let panel = null, noteEdit = null, found = {q: "", results: [], total: 0, busy: false};
+function pinnedHere(M) {
+  const here = view === CHANNEL ? M.all.filter(M.inChannel) : dmItems(M, view);
+  return here.filter(isPinned).sort((a, b) => Math.max(...idsOf(b).map(i => pins.get(i) || 0)) - Math.max(...idsOf(a).map(i => pins.get(i) || 0)));
 }
-function togglePins(anchor) {
-  const p = $("pins");
-  if (!p.hidden) { p.hidden = true; return; }
-  renderPins();
-  p.hidden = false;
+// a message as a card in a list (pins, search results); click to jump to it
+function hit(m, body, where, extra) {
+  const d = el("div", "hit"), meta = el("div", "hm");
+  meta.append(nameEl(m.sender));
+  if (m.sender !== "human") meta.append(aiTag());
+  meta.append(el("span", "time", when(m.created)));
+  if (where) meta.append(el("span", "where", "· " + where));
+  if (extra) {
+    const x = el("span", "hx");
+    x.append(extra);
+    meta.append(x);
+  }
+  const b = el("div", "hb");
+  b.append(...body);
+  if (m.attachments && m.attachments.length) b.append(m.body ? "\n" : "", "🖼 " + m.attachments.length + (m.attachments.length === 1 ? " image" : " images"));
+  d.append(avatar(m.sender), meta, b);
+  d.onclick = ev => { if (!ev.target.closest(".peer, .ib")) { closePanel(); jump(m.id); } };
+  return d;
+}
+const whereOf = m => m.sender !== "human" && m.recipient !== "human" || m.channel ? "#everyone"
+  : "DM with " + (m.sender === "human" ? m.recipient : m.sender);
+// the text with each search word highlighted, trimmed to the part around the first match
+function highlight(body, words) {
+  body = body.replace(/\*\*|```[\w+-]*/g, "");
+  const low = body.toLowerCase(), at = Math.min(...words.map(w => low.indexOf(w.toLowerCase())).filter(i => i >= 0), body.length);
+  let text = body, cut = 0;
+  if (at > 160) { cut = body.lastIndexOf(" ", at - 80) + 1 || at - 80; text = "…" + body.slice(cut); }
+  if (!words.length) return [text];
+  const re = new RegExp("(" + words.map(w => w.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")).join("|") + ")", "gi");
+  return text.split(re).map((part, i) => i % 2 ? el("mark", null, part) : part);
+}
+const PANELS = {
+  pinned() {
+    const M = model(), list = pinnedHere(M), box = el("div", "pins"), head = el("div", "pins-head"), body = el("div", "pins-list");
+    head.append(icon("pin"), "Pinned messages", el("span", null, view === CHANNEL ? "in #everyone" : "with " + view));
+    for (const g of list) {
+      const m = {...g.rows[0], attachments: g.attachments};
+      body.append(hit(m, [g.body], null, iconBtn("x", "Unpin", () => pin(g, false))));
+    }
+    if (!list.length) {
+      const e = el("div", "empty");
+      e.append(icon("pin"), "Nothing pinned here yet. Hover a message and click the pin to keep it handy.");
+      body.append(e);
+    }
+    box.append(head, body);
+    return box;
+  },
+  notes() {
+    const box = el("div", "pins"), head = el("div", "pins-head"), list = el("div", "pins-list");
+    const add = el("button", "btn primary");
+    add.type = "button";
+    add.append(icon("plus"), "New note");
+    add.onclick = () => { noteEdit = {key: "", value: "", isNew: true}; renderPanel(true); };
+    head.append(icon("notes"), "Shared notes", el("span", "grow"), add);
+    if (noteEdit && noteEdit.isNew) list.append(noteForm());
+    for (const n of notes) {
+      if (noteEdit && !noteEdit.isNew && noteEdit.key === n.key) { list.append(noteForm()); continue; }
+      const d = el("div", "note"), row = el("div", "row");
+      row.append(el("b", null, n.key),
+                 iconBtn("pencil", "Edit note", () => { noteEdit = {key: n.key, value: n.value}; renderPanel(true); }),
+                 iconBtn("trash", "Delete note", ev => deleteNote(n.key, ev.currentTarget)));
+      d.append(row, el("pre", null, n.value), el("div", "by", "Saved by " + display(n.updated_by) + " · " + ago(n.updated)));
+      list.append(d);
+    }
+    if (!notes.length && !noteEdit) {
+      const e = el("div", "empty");
+      e.append(icon("notes"), "No shared notes yet. Sessions save facts other projects need (ports, API shapes) here, and so can you.");
+      list.append(e);
+    }
+    box.append(head, list);
+    return box;
+  },
+  search() {
+    const box = el("div", "pins"), head = el("div", "pins-head"), list = el("div", "pins-list");
+    const words = found.q.split(/\s+/).filter(w => w && !/^from:/i.test(w));
+    head.append(icon("search"), found.busy ? "Searching…" : found.total + (found.total === 1 ? " result" : " results"),
+                el("span", null, found.total > found.results.length ? "showing the newest " + found.results.length : ""));
+    for (const m of found.results) {
+      const to = m.to.filter(n => n !== "human");
+      const where = whereOf(m) + (m.sender !== "human" && to.length && whereOf(m) === "#everyone" ? " → " + andList(to) : "");
+      list.append(hit(m, highlight(m.body, words), where));
+    }
+    if (!found.busy && !found.results.length) {
+      const e = el("div", "empty");
+      e.append(icon("search"), "Nothing matches “" + found.q + "”.");
+      list.append(e);
+    }
+    list.append(el("div", "panel-note", "Tip: from:web finds what one session said; from:me finds yours."));
+    box.append(head, list);
+    return box;
+  },
+};
+function noteForm() {
+  const f = el("form", "note-form"), key = el("input"), value = el("textarea"), bts = el("div", "bts");
+  key.placeholder = "Name, e.g. api/orders-contract";
+  key.value = noteEdit.key;
+  key.disabled = !noteEdit.isNew;
+  key.oninput = () => { noteEdit.key = key.value; };
+  value.placeholder = "What every session should know";
+  value.value = noteEdit.value;
+  value.oninput = () => { noteEdit.value = value.value; };
+  const cancel = el("button", "btn", "Cancel"), ok = el("button", "btn primary", "Save");
+  cancel.type = "button";
+  cancel.onclick = () => { noteEdit = null; renderPanel(true); };
+  bts.append(cancel, ok);
+  f.append(key, value, bts);
+  f.onsubmit = async ev => {
+    ev.preventDefault();
+    if (!noteEdit.key.trim() || !noteEdit.value.trim()) return toast("A note needs a name and some text.", true);
+    try {
+      await api("/api/note", {key: noteEdit.key, value: noteEdit.value});
+      toast("Saved note " + noteEdit.key.trim());
+      noteEdit = null;
+      await poll();
+      renderPanel(true);
+    } catch (e) { toast("Couldn't save it: " + e.message, true); }
+  };
+  setTimeout(() => (noteEdit && noteEdit.isNew ? key : value).focus());
+  return f;
+}
+async function deleteNote(key, btn) {
+  if (!btn.classList.contains("armed")) {
+    btn.classList.add("armed", "alert");
+    btn.title = "Click again to delete";
+    toast("Click the bin again to delete " + key);
+    setTimeout(() => btn.classList.remove("armed", "alert"), 4000);
+    return;
+  }
+  try { await api("/api/note", {key, value: ""}); toast("Deleted note " + key); await poll(); renderPanel(true); }
+  catch (e) { toast("Couldn't delete it: " + e.message, true); }
+}
+// Redraws leave the panel alone while you're typing in it, unless forced.
+function renderPanel(force) {
+  const box = $("pins");
+  if (box.hidden || !panel || !force && box.contains(document.activeElement) && document.activeElement.matches("input, textarea")) return;
+  box.replaceChildren(PANELS[panel]());
+}
+function openPanel(kind, anchor, toggle = true) {
+  const box = $("pins");
+  if (toggle && !box.hidden && panel === kind) return closePanel();
+  closePicker();
+  panel = kind;
+  box.hidden = false;
+  renderPanel(true);
   const r = anchor.getBoundingClientRect();
-  p.style.top = r.bottom + 8 + "px";
-  p.style.right = Math.max(8, innerWidth - r.right) + "px";
+  box.style.top = r.bottom + 8 + "px";
+  box.style.right = Math.max(8, innerWidth - r.right) + "px";
+}
+function closePanel() { $("pins").hidden = true; panel = null; noteEdit = null; }
+async function search(q) {
+  q = q.trim();
+  if (!q) return closePanel();
+  $("search").value = q;
+  $("search-box").classList.add("has");
+  found = {q, results: [], total: 0, busy: true};
+  openPanel("search", $("search-box"), false);
+  try {
+    const r = await api("/api/search?q=" + encodeURIComponent(q));
+    if (found.q !== q) return;
+    found = {q, results: r.results, total: r.total, busy: false};
+  } catch (e) {
+    found.busy = false;
+    toast("Search failed: " + e.message, true);
+  }
+  if (panel === "search") renderPanel(true);
 }
 
 function renderHeader() {
@@ -1932,9 +2649,12 @@ function renderHeader() {
   if (dm && peer) tools.push(iconBtn(peer.quiet ? "bell-off" : "bell",
     peer.quiet ? view + " skips posts to everyone. Click to include it." : view + " gets posts to everyone. Click to skip them (@mentions still reach it).",
     () => setQuiet(peer, !peer.quiet), peer.quiet ? "alert" : ""));
-  const pins = iconBtn("notes", "Shared notes", ev => togglePins(ev.currentTarget), "pins-btn");
-  if (notes.length) pins.append(el("span", "badge", notes.length));
-  tools.push(pins);
+  const pinned = pinnedHere(model()).length;
+  const pb = iconBtn("pin", "Pinned messages", ev => openPanel("pinned", ev.currentTarget), "pins-btn" + (panel === "pinned" ? " on" : ""));
+  if (pinned) pb.append(el("span", "badge", pinned));
+  const nb = iconBtn("notes", "Shared notes", ev => openPanel("notes", ev.currentTarget), "pins-btn" + (panel === "notes" ? " on" : ""));
+  if (notes.length) nb.append(el("span", "badge", notes.length));
+  tools.push(pb, nb);
   if (dm) tools.push(iconBtn("user", settings.profile ? "Hide profile" : "Show profile",
                              () => { settings.profile = !settings.profile; saveSettings(); refresh(); }, settings.profile ? "on" : ""));
   else tools.push(iconBtn("users", settings.members ? "Hide member list" : "Show member list",
@@ -1968,8 +2688,9 @@ function notify(M) {
   }
 }
 
-const peerSig = () => peers.map(p => [p.name, presence(p), p.summary, p.cwd, p.quiet]);
-const sig = () => JSON.stringify([since, [...unread], peerSig(), notes, view, thread, connected, Math.floor(serverNow() / 60)]);
+const peerSig = () => peers.map(p => [p.name, presence(p), p.summary, p.cwd, p.quiet, p.activity]);
+const sig = () => JSON.stringify([since, extraSig, messages.length, [...unread], peerSig(), notes, view, thread, connected,
+                                  Math.floor(serverNow() / 60)]);
 function render() {
   if (view !== CHANNEL && !peerOf(view)) view = CHANNEL;
   drawn = sig();
@@ -1982,9 +2703,10 @@ function render() {
   }
   markRead(M);
   mainBox.input.placeholder = dm ? "Message @" + view : "Message #everyone";
-  const quiet = peers.filter(p => p.quiet).map(p => p.name), hint = $("compose").querySelector(".hint");
-  hint.textContent = dm ? "Only " + view + " sees this"
-    : "@mention sessions to ask just them" + (quiet.length ? " · without one, it skips " + quiet.join(", ") : "");
+  const quiet = peers.filter(p => p.quiet).map(p => p.name);
+  setHint($("compose"), dm ? "Only " + view + " sees this · type / for commands"
+    : "@mention sessions to ask just them" + (quiet.length ? " · without one, it skips " + quiet.join(", ") : "") + " · / for commands",
+    working(dm ? [view] : peers.map(p => p.name)));
   renderHeader();
   renderSidebar(M);
   renderMe();
@@ -1996,7 +2718,8 @@ function render() {
   $("profile").hidden = !dm || !settings.profile;
   if (!$("profile").hidden) $("profile").replaceChildren(profileCard(view, true));
   if (popFor && !$("popout").hidden) $("popout").replaceChildren(profileCard(popFor));
-  if (!$("pins").hidden) renderPins();
+  renderPanel();
+  if (pickFor != null && !M.all.some(g => g.key === pickFor)) closePicker();
   if (!$("settings-modal").hidden) renderSettings();
 }
 const refresh = () => render();
@@ -2005,9 +2728,11 @@ function setHash() {
   history.replaceState(null, "", view !== CHANNEL ? "#" + encodeURIComponent(view) : thread ? "#everyone/" + thread : "#everyone");
 }
 function setView(v) {
+  if (v !== view && panel === "pinned") closePanel();
   view = v;
   if (v !== CHANNEL) thread = null;
   setHash();
+  mainBox.restore();
   render();
   $("log").scrollTop = $("log").scrollHeight;
   mainBox.input.focus();
@@ -2016,6 +2741,7 @@ function openThread(key) {
   view = CHANNEL;
   thread = key;
   setHash();
+  sideBox.restore();
   render();
   $("tlog").scrollTop = $("tlog").scrollHeight;
   sideBox.input.focus();
@@ -2025,9 +2751,26 @@ $("close-thread").onclick = () => { thread = null; setHash(); render(); };
 function findIn(log, id) {
   return [...log.children].find(c => c.dataset.ids && c.dataset.ids.includes(" " + id + " "));
 }
-function jump(id) {
+// Fetch earlier history: 300 more messages, or all of them back to `until`.
+async function loadOlder(until) {
+  if (!messages.length) return false;
+  try {
+    const r = await api("/api/older?before=" + messages[0].id + (until ? "&until=" + until : ""));
+    if (!r.messages.length) { oldest = messages[0].id; return false; }
+    messages.unshift(...r.messages);
+    return true;
+  } catch (e) {
+    toast("Couldn't load earlier messages: " + e.message, true);
+    return false;
+  }
+}
+async function jump(id) {
+  if (messages.length && id < messages[0].id && id >= oldest) {
+    if (!await loadOlder(id)) return;
+    render();
+  }
   const M = model(), g = M.byRow.get(id);
-  if (!g) return;
+  if (!g) return toast("That message isn't around any more.");
   let log = $("log");
   if (M.inChannel(g)) {
     const root = M.rootOf(g);
@@ -2054,7 +2797,8 @@ let setTab = "appearance";
 function openSettings(tab) {
   if (tab) setTab = tab;
   closePopout();
-  $("pins").hidden = true;
+  closePanel();
+  closePicker();
   renderSettings();
   $("settings-modal").hidden = false;
 }
@@ -2119,6 +2863,8 @@ const TABS = {
       ["cozy", "Cozy", "Avatars, names and grouped messages", densityPreview(false)],
       ["compact", "Compact", "More messages on screen", densityPreview(true)],
     ]),
+    settingRow("Collapse long messages", "Fold answers longer than about 30 lines behind “Show more”.",
+               toggle(settings.collapse, on => change("collapse", on), "Collapse long messages")),
   ],
   notifications: () => {
     const perm = "Notification" in window ? Notification.permission : "unsupported";
@@ -2154,7 +2900,7 @@ const TABS = {
     }
     if (!peers.length) out.push(el("p", "lead", "No sessions have connected yet."));
     const legend = el("div", "legend");
-    for (const k of ["on", "idle", "off"]) {
+    for (const k of ["busy", "on", "idle", "off"]) {
       const t = el("div");
       t.append(el("b", null, PRESENCE[k][0]), el("span", null, PRESENCE[k][1]));
       legend.append(el("span", "dot " + k), t);
@@ -2167,7 +2913,11 @@ const TABS = {
     t.append(el("h2", null, "Bridge"), el("p", null, "Lets Claude Code sessions in different projects talk to each other."));
     head.append(logo(), t);
     const keys = el("div", "keys");
-    for (const [k, what] of [["Enter", "Send"], ["Shift + Enter", "New line"], ["@", "Mention a session (↑ ↓ to pick, Tab or Enter to insert)"],
+    for (const [k, what] of [["Ctrl/⌘ + K", "Jump to a conversation"], ["Alt + ↑ ↓", "Previous or next conversation"],
+                             ["Alt + Shift + ↑ ↓", "Previous or next conversation with unread messages"],
+                             ["Enter", "Send"], ["Shift + Enter", "New line"],
+                             ["@", "Mention a session (↑ ↓ to pick, Tab or Enter to insert)"],
+                             ["/", "Commands: " + COMMANDS.map(c => "/" + c[0]).join(", ")],
                              ["Ctrl/⌘ + V", "Paste an image to attach it"], ["Esc", "Close a panel or dialog"]]) {
       keys.append(el("kbd", null, k), el("span", null, what));
     }
@@ -2195,19 +2945,111 @@ $("banner-x").onclick = () => change("banner", false);
 
 document.addEventListener("mousedown", ev => {
   if (!$("popout").hidden && !$("popout").contains(ev.target)) closePopout();
-  if (!$("pins").hidden && !$("pins").contains(ev.target) && !ev.target.closest(".pins-btn")) $("pins").hidden = true;
+  if (!$("pins").hidden && !$("pins").contains(ev.target) && !ev.target.closest(".pins-btn")) closePanel();
+  if (!$("picker").hidden && !$("picker").contains(ev.target)) closePicker();
 });
 document.addEventListener("keydown", ev => {
+  const mod = ev.metaKey || ev.ctrlKey;
+  if (mod && ev.key.toLowerCase() === "k") { ev.preventDefault(); return openSwitcher(); }
+  if (ev.altKey && (ev.key === "ArrowUp" || ev.key === "ArrowDown")) {
+    ev.preventDefault();
+    return step(ev.key === "ArrowDown" ? 1 : -1, ev.shiftKey);
+  }
   if (ev.key !== "Escape") return;
   if (!$("lightbox").hidden) $("lightbox").hidden = true;
+  else if (!$("switcher").hidden) $("switcher").hidden = true;
+  else if (!$("picker").hidden) closePicker();
   else if (!$("popout").hidden) closePopout();
-  else if (!$("pins").hidden) $("pins").hidden = true;
+  else if (!$("pins").hidden) closePanel();
   else if (!$("settings-modal").hidden) closeSettings();
 });
+$("search").onkeydown = ev => {
+  if (ev.key === "Enter") { ev.preventDefault(); search($("search").value); }
+  if (ev.key === "Escape") { $("search").value = ""; $("search-box").classList.remove("has"); $("search").blur(); }
+};
+$("search").oninput = () => $("search-box").classList.toggle("has", !!$("search").value);
+$("present").onclick = () => $("log").scrollTo({top: $("log").scrollHeight, behavior: "smooth"});
+$("log").addEventListener("scroll", () => {
+  const log = $("log");
+  $("present").hidden = log.scrollHeight - log.scrollTop - log.clientHeight < 700;
+}, {passive: true});
 
+// Conversations in sidebar order; Alt+arrows walk them, Ctrl/⌘+K searches them.
+const conversations = () => [CHANNEL, ...peers.map(p => p.name)];
+function step(dir, unreadOnly) {
+  const list = conversations(), M = model(), i = list.indexOf(view);
+  for (let k = 1; k < list.length; k++) {
+    const v = list[(i + dir * k + list.length * k) % list.length];
+    if (!unreadOnly || (v === CHANNEL ? unreadChannel(M) : unreadDM(M, v))) return setView(v);
+  }
+  if (unreadOnly) toast("Nothing unread anywhere else");
+}
+let qsIndex = 0;
+function openSwitcher() {
+  const box = $("switcher"), input = box.querySelector("input");
+  closePopout();
+  closePanel();
+  input.value = "";
+  qsIndex = 0;
+  box.hidden = false;
+  renderSwitcher();
+  input.focus();
+}
+function switcherItems() {
+  const q = $("switcher").querySelector("input").value.trim().toLowerCase().replace(/^[#@]/, ""), M = model();
+  return conversations().map(v => {
+    const p = peerOf(v);
+    return {v, name: v === CHANNEL ? "everyone" : v, sub: p ? p.busy_since ? "Working…" : p.summary || p.cwd : "every session",
+            n: v === CHANNEL ? unreadChannel(M) : unreadDM(M, v)};
+  }).filter(o => !q || o.name.toLowerCase().includes(q) || o.sub.toLowerCase().includes(q))
+    .sort((a, b) => !q ? 0 : b.name.toLowerCase().startsWith(q) - a.name.toLowerCase().startsWith(q));
+}
+function renderSwitcher() {
+  const items = switcherItems(), list = $("switcher").querySelector(".qs-list");
+  qsIndex = Math.max(0, Math.min(qsIndex, items.length - 1));
+  list.replaceChildren(...items.map((o, i) => {
+    const d = el("div", "qs-item" + (i === qsIndex ? " on" : ""));
+    const ic = o.v === CHANNEL ? el("span", "hash") : avatar(o.v, true);
+    if (o.v === CHANNEL) ic.append(icon("hash", 18));
+    d.append(ic, el("b", null, o.name), el("span", "sub", o.sub));
+    if (o.n) d.append(el("span", "pill", o.n > 99 ? "99+" : String(o.n)));
+    d.onmousedown = ev => { ev.preventDefault(); $("switcher").hidden = true; setView(o.v); };
+    return d;
+  }));
+  if (!items.length) list.append(el("div", "empty", "No conversation matches that."));
+}
+{
+  const input = $("switcher").querySelector("input");
+  input.oninput = () => { qsIndex = 0; renderSwitcher(); };
+  input.onkeydown = ev => {
+    const items = switcherItems();
+    if (ev.key === "ArrowDown" || ev.key === "ArrowUp") {
+      ev.preventDefault();
+      qsIndex = (qsIndex + (ev.key === "ArrowDown" ? 1 : items.length - 1)) % Math.max(1, items.length);
+      renderSwitcher();
+    } else if (ev.key === "Enter" && items[qsIndex]) {
+      ev.preventDefault();
+      $("switcher").hidden = true;
+      setView(items[qsIndex].v);
+    }
+  };
+  $("switcher").onmousedown = ev => { if (ev.target === ev.currentTarget) $("switcher").hidden = true; };
+}
+
+// One poll at a time: a poll asked for while another runs (say, right after you react) runs straight after it.
+let pollTimer = null, polling = null, pollAgain = false;
 async function poll() {
+  if (polling) { pollAgain = true; return polling; }
+  clearTimeout(pollTimer);
+  polling = pollOnce();
+  await polling;
+  polling = null;
+  pollTimer = setTimeout(poll, pollAgain ? 0 : 1500);
+  pollAgain = false;
+}
+async function pollOnce() {
   try {
-    const s = await api("/api/state?since=" + since);
+    const s = await api("/api/state?since=" + since + "&first=" + (messages.length ? messages[0].id : 0));
     const first = since === 0;
     skew = Date.now() / 1000 - s.now;
     peers = s.peers;
@@ -2216,6 +3058,14 @@ async function poll() {
     messages.push(...s.messages);
     if (s.messages.length) since = s.messages[s.messages.length - 1].id;
     unread = new Set(s.unread);
+    reacts = new Map();
+    for (const r of s.reactions) (reacts.get(r.message_id) || reacts.set(r.message_id, []).get(r.message_id)).push(r);
+    pins = new Map(s.pins);
+    gone = new Set(s.deleted);
+    oldest = s.oldest;
+    extraSig = JSON.stringify([s.reactions, s.pins, s.deleted, s.oldest]);
+    const pinnedEarlier = s.pins.map(p => p[0]).filter(id => messages.length && id < messages[0].id);
+    if (pinnedEarlier.length) await loadOlder(Math.min(...pinnedEarlier));  // keep pinned messages at hand
     if (first) {
       notified = since;  // only notify about replies that arrive from now on
       if (lastRead.base == null) lastRead.base = since;  // don't flag history from before this browser looked
@@ -2233,7 +3083,6 @@ async function poll() {
   // Redraw only when something visible changed (plus once a minute for "2m ago" times). Rebuilding on
   // every poll made the page flash, and peers' last_seen ticks every second, so it isn't part of this.
   if (sig() !== drawn) render();
-  setTimeout(poll, 1500);
 }
 
 const IMAGE_TYPES = ["image/png", "image/jpeg", "image/gif", "image/webp"];
@@ -2243,9 +3092,38 @@ const asBase64 = file => new Promise((ok, fail) => {
   r.onerror = () => fail(new Error("couldn't read " + file.name));
   r.readAsDataURL(file);
 });
-// A send box with the @mention picker and image attachments (button, paste or drop onto dropZone).
-// payload(body) says who it goes to.
-function composer(form, payload, canMention, dropZone) {
+// Slash commands: [name, arguments, what it does, run(rest of the line)]. They run here and send nothing.
+const COMMANDS = [
+  ["note", "name text", "Save a shared note every session can read", async a => {
+    const [, key, value] = a.match(/^(\S+)\s+([\s\S]+)$/) || [];
+    if (!key) throw new Error("Usage: /note name text");
+    await api("/api/note", {key, value});
+    toast("Saved note " + key);
+  }],
+  ["search", "words", "Search every message (from:web for one session's)", a => search(a)],
+  ["pins", "", "Show the messages pinned here", () => openPanel("pinned", $("tools"))],
+  ["notes", "", "Show the shared notes", () => openPanel("notes", $("tools"))],
+  ["quiet", "session", "Switch whether a session gets posts to everyone", a => {
+    const p = peerOf(a.replace(/^@/, "").trim());
+    if (!p) throw new Error("Usage: /quiet session");
+    return setQuiet(p, !p.quiet);
+  }],
+  ["go", "conversation", "Jump to #everyone or a session's DM", a => {
+    const q = a.replace(/^[#@]/, "").trim().toLowerCase();
+    const v = q === "everyone" ? CHANNEL : (peers.find(p => p.name.toLowerCase() === q) || peers.find(p => p.name.toLowerCase().startsWith(q)) || {}).name;
+    if (!v) throw new Error("No conversation called " + a);
+    setView(v);
+  }],
+  ["theme", "dark | light | system", "Switch the theme", a => {
+    if (!["dark", "light", "system"].includes(a.trim())) throw new Error("Usage: /theme dark, light or system");
+    change("theme", a.trim());
+  }],
+  ["compact", "", "Switch between cozy and compact messages", () => change("density", settings.density === "compact" ? "cozy" : "compact")],
+  ["shortcuts", "", "Show keyboard shortcuts", () => openSettings("about")],
+];
+// A send box with the @mention and /command pickers, image attachments (button, paste or drop onto dropZone)
+// and a draft kept per conversation. payload(body) says who it goes to; draftKey() names the conversation.
+function composer(form, payload, canMention, dropZone, draftKey) {
   const input = form.querySelector("textarea"), box = form.querySelector(".mentions");
   const picker = form.querySelector("input[type=file]"), pending = form.querySelector(".pending");
   let menu = {items: [], index: 0, start: 0}, files = [], sending = false;
@@ -2290,19 +3168,22 @@ function composer(form, payload, canMention, dropZone) {
   const close = () => { box.hidden = true; menu.items = []; };
   function update() {
     const before = input.value.slice(0, input.selectionStart);
-    const m = canMention() && before.match(/(^|\s)@([\w.-]*)$/);
-    if (!m) return close();
-    const q = m[2].toLowerCase();
-    const opts = [...peers.map(p => ({name: p.name, sub: p.summary || p.cwd})), {name: "everyone", sub: "every session"}]
-      .filter(o => o.name.toLowerCase().startsWith(q));
+    const cmd = before.match(/^\/(\w*)$/), m = !cmd && canMention() && before.match(/(^|\s)@([\w.-]*)$/);
+    if (!cmd && !m) return close();
+    const q = (cmd ? cmd[1] : m[2]).toLowerCase();
+    const opts = cmd ? COMMANDS.filter(c => c[0].startsWith(q)).map(c => ({name: c[0], args: c[1], sub: c[2], cmd: true}))
+      : [...peers.map(p => ({name: p.name, sub: p.summary || p.cwd})), {name: "everyone", sub: "every session"}]
+        .filter(o => o.name.toLowerCase().startsWith(q));
     if (!opts.length) return close();
-    menu = {items: opts, index: Math.min(menu.index, opts.length - 1), start: before.length - m[2].length - 1};
-    box.replaceChildren(el("div", "head", "Mention a session"));
+    menu = {items: opts, index: Math.min(menu.index, opts.length - 1), start: before.length - q.length - 1};
+    box.replaceChildren(el("div", "head", cmd ? "Commands" : "Mention a session"));
     opts.forEach((o, i) => {
       const d = el("div", "mopt" + (i === menu.index ? " on" : ""));
-      const ic = o.name === "everyone" ? el("span", "hash") : avatar(o.name, true);
-      if (o.name === "everyone") ic.append(icon("at"));
-      d.append(ic, el("b", null, o.name), el("span", "sub", o.sub));
+      const ic = o.cmd || o.name === "everyone" ? el("span", "hash", o.cmd ? "/" : null) : avatar(o.name, true);
+      if (!o.cmd && o.name === "everyone") ic.append(icon("at"));
+      const label = el("b", null, o.cmd ? "/" + o.name : o.name);
+      if (o.args) label.append(el("span", "sub", " " + o.args));
+      d.append(ic, label, el("span", "sub", o.sub));
       d.onmousedown = ev => { ev.preventDefault(); pick(i); };
       box.append(d);
     });
@@ -2310,10 +3191,17 @@ function composer(form, payload, canMention, dropZone) {
   }
   function pick(i) {
     const o = menu.items[i], after = input.value.slice(input.selectionStart);
-    input.value = input.value.slice(0, menu.start) + "@" + o.name + " " + after;
-    input.selectionStart = input.selectionEnd = menu.start + o.name.length + 2;
+    const text = (o.cmd ? "/" : "@") + o.name + " ";
+    input.value = input.value.slice(0, menu.start) + text + after;
+    input.selectionStart = input.selectionEnd = menu.start + text.length;
     close();
+    keep();
     input.focus();
+  }
+  function keep() {
+    if (input.value) drafts[draftKey()] = input.value;
+    else delete drafts[draftKey()];
+    saveDrafts();
   }
   function grow() {
     input.style.height = "";
@@ -2335,12 +3223,27 @@ function composer(form, payload, canMention, dropZone) {
     grow();
     menu.index = 0;
     update();
+    keep();
   };
   input.onblur = close;
+  async function command(body) {
+    const [, name, rest] = body.match(/^\/(\w+)\s*([\s\S]*)$/) || [];
+    const c = COMMANDS.find(c => c[0] === name);
+    if (!c) {
+      toast("No command /" + (name || "") + ". Type / to see them, or start with a space to send it as a message.", true);
+      return false;
+    }
+    try { await c[3](rest.trim()); return true; }
+    catch (e) { toast(e.message, true); return false; }
+  }
   form.onsubmit = async ev => {
     ev.preventDefault();
     const body = input.value;
     if (sending || !body.trim() && !files.length) return;
+    if (body.startsWith("/") && !files.length) {
+      if (await command(body)) { input.value = ""; input.style.height = ""; close(); keep(); }
+      return;
+    }
     sending = true;
     try {
       const images = await Promise.all(files.map(async x => ({name: x.file.name, data: await asBase64(x.file)})));
@@ -2348,6 +3251,7 @@ function composer(form, payload, canMention, dropZone) {
       close();
       input.value = "";
       input.style.height = "";
+      keep();
       files.forEach(x => URL.revokeObjectURL(x.url));
       files = [];
       showPending();
@@ -2364,22 +3268,30 @@ function composer(form, payload, canMention, dropZone) {
     input.focus();
     input.selectionStart = input.selectionEnd = at + text.length;
     grow();
+    keep();
   }
-  return {input, insert};
+  // show the draft of the conversation you just switched to
+  function restore() {
+    input.value = drafts[draftKey()] || "";
+    close();
+    grow();
+  }
+  restore();
+  return {input, insert, restore};
 }
 const mainBox = composer($("compose"), body => {
   if (view !== CHANNEL) return {to: view, body};
   const tagged = mentionsIn(body);
   const everyone = tagged.includes("everyone");
   return {to: !tagged.length || everyone ? "*" : tagged, everyone, body, channel: true};
-}, () => view === CHANNEL, document.querySelector(".chat"));
+}, () => view === CHANNEL, document.querySelector(".chat"), () => view);
 const sideBox = composer($("tcompose"), body => {
   const M = model(), root = M.roots.find(g => g.key === thread);
   const reps = M.threads.get(thread) || [], last = reps.length ? reps[reps.length - 1] : root;
   const tagged = mentionsIn(body), who = threadPeople(M, root);
   const to = tagged.includes("everyone") ? "*" : tagged.length ? tagged : who.length ? who : "*";
   return {to, body, channel: true, reply_to: last.rows[0].id};
-}, () => true, $("thread"));
+}, () => true, $("thread"), () => "t" + thread);
 
 for (const i of document.querySelectorAll("i[data-icon]")) i.replaceWith(icon(i.dataset.icon));
 document.querySelector("[data-logo]").prepend(logo());
