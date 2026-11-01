@@ -31,6 +31,10 @@ of the change and report back. You watch, and join in, from one local page.
   (the gear by your name) cover dark/light theme, cozy or compact messages, sounds and desktop
   notifications. Sessions' Markdown (code blocks with a copy button, tables, lists, links) renders
   as you'd expect, and long answers fold behind "Show more".
+- **Private channels.** Click **+** next to *Channels* (or `/channel name web api`) to make a
+  channel like `#frontend` and pull in just the sessions you want. Posts there reach only its
+  members, their replies stay in it, and Bridge refuses to let them message anyone outside it from
+  there, so a side conversation between two sessions doesn't spill into the rest.
 - **See who's working.** A session in the middle of a turn shows as *Working*, with what it's on
   ("web is working… Fixing the checkout totals row"), and your messages say whether they've been
   seen yet, or why not (mid-turn, or not listening).
@@ -66,6 +70,7 @@ The API session makes its change, then messages the web and mobile sessions with
 ```sh
 python3 bridge.py gui            # live view of all sessions at http://127.0.0.1:8765/
 python3 bridge.py quiet NAME     # NAME skips posts to everyone; only @mentions reach it (off to undo)
+python3 bridge.py channel api web mobile  # private #api with just web and mobile (no names: delete it)
 python3 bridge.py peers          # list connected sessions
 python3 bridge.py log 50         # last 50 messages
 python3 bridge.py send web "…"   # message a session from the terminal (as "human")

@@ -13,7 +13,8 @@ Usage:
     bridge.py stop             # Stop hook: delivers late messages, keeps the listener alive
     bridge.py send TO MESSAGE  # send a message from the terminal (as "human")
     bridge.py quiet NAME [on|off]  # NAME skips messages to everyone (only @mentions reach it)
-    bridge.py post TO MESSAGE [--image PATH]... [--reply-to ID]
+    bridge.py channel NAME [PEER...]  # make channel #NAME with just these sessions (no peers: delete it)
+    bridge.py post TO MESSAGE [--image PATH]... [--reply-to ID] [--channel NAME]
                                # send as this folder's session, with images (sessions can run it via Bash)
     bridge.py peers            # list known sessions
     bridge.py log [N]          # show the last N messages
@@ -71,6 +72,11 @@ CREATE TABLE IF NOT EXISTS reactions (
     created REAL NOT NULL,
     PRIMARY KEY (message_id, who, emoji)
 );
+CREATE TABLE IF NOT EXISTS channels (
+    name TEXT PRIMARY KEY,
+    members TEXT NOT NULL,  -- JSON list of peer names
+    created REAL NOT NULL
+);
 """
 BUSY_TTL = 30 * 60  # a turn the Stop hook never closed (you interrupted it, say) stops counting as working after this
 
@@ -97,6 +103,8 @@ def connect():
         "ALTER TABLE messages ADD COLUMN pinned REAL",
         # when the human unsent it (only possible before any session read it)
         "ALTER TABLE messages ADD COLUMN deleted REAL",
+        # the channel (other than #everyone) it was posted in; only that channel's members get it
+        "ALTER TABLE messages ADD COLUMN room TEXT",
     ):
         try:
             db.execute(migration)
@@ -171,6 +179,44 @@ def save_note(db, key, value, who):
     return f"Saved note '{key}'."
 
 
+def channel_members(db, name):
+    """The sessions in channel #name, or None when there's no such channel."""
+    r = db.execute("SELECT members FROM channels WHERE name = ?", (name,)).fetchone()
+    return json.loads(r["members"]) if r else None
+
+
+def save_channel(db, name, members):
+    """Create channel #name, or change who's in it; no members deletes it (its messages stay in the log)."""
+    name = str(name).strip().lstrip("#").lower()
+    if not name or len(name) > 40 or name == "everyone" or not all(c.isalnum() or c in "-_" for c in name):
+        raise ValueError("A channel name is up to 40 letters, digits, - or _ (and not 'everyone').")
+    if not members:
+        db.execute("DELETE FROM channels WHERE name = ?", (name,))
+        return name
+    known = {r["name"] for r in db.execute("SELECT name FROM peers")}
+    members = list(dict.fromkeys(str(m) for m in members))
+    unknown = [m for m in members if m not in known]
+    if unknown:
+        raise ValueError(f"Unknown peer '{unknown[0]}'")
+    db.execute("INSERT INTO channels (name, members, created) VALUES (?, ?, ?) "
+               "ON CONFLICT(name) DO UPDATE SET members = excluded.members", (name, json.dumps(members), time.time()))
+    return name
+
+
+def channel_rules(db, rows):
+    """What a session must know about the channels the given messages came from."""
+    out = []
+    for room in dict.fromkeys(r["room"] for r in rows if r["room"]):
+        members = channel_members(db, room)
+        if members is None:
+            out.append(f"#{room} has been deleted; don't continue its conversation elsewhere.")
+        else:
+            out.append(f"#{room} is a private channel with only {', '.join(members)}. Keep its conversation there: "
+                       f"answer with `send` and reply_to (or channel='{room}'). Only its members can be reached in it, "
+                       f"so don't take its work to other sessions or to #everyone.")
+    return "\n".join(out)
+
+
 def ago(ts):
     s = int(time.time() - ts)
     if s < 60:
@@ -183,7 +229,7 @@ def ago(ts):
 
 
 def fmt_message(m):
-    where = " in #everyone" if m["sender"] == "human" and m["channel"] else ""
+    where = f" in #{m['room']}" if m["room"] else " in #everyone" if m["sender"] == "human" and m["channel"] else ""
     head = f"[#{m['id']} from {m['sender']}{where}, {ago(m['created'])}"
     if m["reply_to"]:
         head += f", reply to #{m['reply_to']}"
@@ -292,15 +338,37 @@ class Bridge:
             out.append(line)
         if len(out) == 1:
             out.append("No other sessions have connected yet.")
+        mine = [f"#{r['name']} ({', '.join(json.loads(r['members']))})"
+                for r in self.db.execute("SELECT * FROM channels ORDER BY name") if self.me in json.loads(r["members"])]
+        if mine:
+            out.append("Private channels you're in (only their members can be reached there): " + "; ".join(mine))
         return "\n".join(out)
 
     def describe(self, summary):
         self.db.execute("UPDATE peers SET summary = ? WHERE name = ?", (summary, self.me))
         return f"Updated description for '{self.me}'."
 
-    def send(self, to, message, reply_to=None, attachments=None):
+    def send(self, to, message, reply_to=None, attachments=None, channel=None):
+        room = str(channel).strip().lstrip("#") if channel else None
+        if room == "everyone":
+            room = None
+        elif not room and reply_to:  # answers stay in the channel of the post they answer
+            parent = self.db.execute("SELECT room FROM messages WHERE id = ?", (reply_to,)).fetchone()
+            room = parent["room"] if parent else None
         recipients = [to]
-        if to == "*":
+        if room:
+            members = channel_members(self.db, room)
+            if members is None:
+                raise ValueError(f"There's no channel #{room}.")
+            if self.me not in members:
+                raise ValueError(f"You aren't in #{room}.")
+            others = [m for m in members if m != self.me]
+            if to == "*":
+                recipients = others
+            elif to != "human" and to not in others:
+                raise ValueError(f"'{to}' isn't in #{room}; only {', '.join(others) or 'you'} can be reached there. "
+                                 f"Ask the user to add it to the channel if you need it.")
+        elif to == "*":
             recipients = [r["name"] for r in self.db.execute("SELECT name FROM peers WHERE name != ? AND NOT quiet", (self.me,))]
         elif to != "human" and not self.db.execute("SELECT 1 FROM peers WHERE name = ?", (to,)).fetchone():
             return f"Unknown peer '{to}'. Known peers:\n{self.peers()}"
@@ -308,16 +376,19 @@ class Bridge:
         ids, now = [], time.time()  # one timestamp, so the GUI can show a broadcast once
         for r in recipients:
             cur = self.db.execute(
-                "INSERT INTO messages (sender, recipient, body, reply_to, created, attachments) VALUES (?, ?, ?, ?, ?, ?)",
-                (self.me, r, message, reply_to, now, json.dumps(files) if files else None),
+                "INSERT INTO messages (sender, recipient, body, reply_to, created, attachments, room) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (self.me, r, message, reply_to, now, json.dumps(files) if files else None, room),
             )
             ids.append(f"#{cur.lastrowid} -> {r}")
-        sent = "Sent " + ", ".join(ids) if ids else "No other peers to send to."
+        sent = "Sent " + ", ".join(ids) + (f" in #{room}" if room and ids else "") if ids else "No other peers to send to."
         return sent + (f" with {len(files)} image(s)." if files and ids else "")
 
     def inbox(self):
         rows = take_unread(self.db, self.me)
-        return "\n\n".join(fmt_message(r) for r in rows) if rows else "No new messages."
+        if not rows:
+            return "No new messages."
+        rules = channel_rules(self.db, rows)
+        return "\n\n".join(fmt_message(r) for r in rows) + (f"\n\n{rules}" if rules else "")
 
     def wait(self, timeout=120, reply_to=None):
         timeout = max(1, min(int(timeout), 600))
@@ -376,13 +447,15 @@ TOOLS = [
      schema({"summary": STR}, ["summary"]), lambda b, a: b.describe(a["summary"])),
     ("send", "Post a message in the shared #everyone channel, @mentioning another session by peer name; that session is "
              "woken to handle it and the user sees it in the channel. '*' addresses every session. Use reply_to with a "
-             "message id when answering. Attach screenshots or diagrams with `attachments` when they add context.",
-     schema({"to": STR, "message": STR, "reply_to": INT,
+             "message id when answering; a reply to a post in a private channel stays in that channel, where only its "
+             "members can be reached. `channel` starts a new post in a private channel you're in ('*' is then all its "
+             "members). Attach screenshots or diagrams with `attachments` when they add context.",
+     schema({"to": STR, "message": STR, "reply_to": INT, "channel": STR,
              "attachments": {"type": "array", "items": STR,
                              "description": f"Paths of image files (PNG, JPG, GIF, WebP; up to {MAX_ATTACHMENTS}, "
                                             f"{MAX_ATTACHMENT_BYTES // 2**20} MB each) to attach."}},
             ["to", "message"]),
-     lambda b, a: b.send(a["to"], a["message"], a.get("reply_to"), a.get("attachments"))),
+     lambda b, a: b.send(a["to"], a["message"], a.get("reply_to"), a.get("attachments"), a.get("channel"))),
     ("react", "React to a message with one emoji instead of replying: 👍 got it, 👀 on it, ✅ done, ❌ can't. It doesn't "
               "wake anyone, so use it to acknowledge a report or answer that needs nothing more.",
      schema({"message_id": INT, "emoji": STR}, ["message_id", "emoji"]), lambda b, a: b.react(a["message_id"], a["emoji"])),
@@ -462,6 +535,11 @@ it is relayed back to where they wrote. Don't `send` to human. If another sessio
 Messages between sessions are posted in #everyone, so write them for both the receiving session and the user.
 A message sent with reply_to goes into the thread of the post it answers, so always pass reply_to when you
 answer or follow up on something; leave it out only to start a new topic.
+
+## Private channels
+The user can make channels (like #frontend) with only some sessions in them. A message from one says so
+("in #frontend"). Keep that conversation in the channel: reply with reply_to (or pass `channel`), talk only
+to its members, and don't carry its work to other sessions or #everyone. `peers` lists the channels you're in.
 
 ## Keep the listener running
 Before anything else, start the Bridge listener: run `{listen}` with the Bash tool and
@@ -548,9 +626,10 @@ def serve():
 
 # --- hook & CLI ----------------------------------------------------------------
 
-def render_inbound(me, rows):
+def render_inbound(db, me, rows):
     body = "\n\n".join(fmt_message(r) for r in rows)
-    return f"<bridge-messages for='{me}'>\n{body}\n</bridge-messages>\n{INBOUND_HINT}"
+    rules = channel_rules(db, rows)
+    return f"<bridge-messages for='{me}'>\n{body}\n</bridge-messages>\n" + (f"{rules}\n" if rules else "") + INBOUND_HINT
 
 
 def restart_hint():
@@ -586,7 +665,7 @@ def listen():
         rows = take_unread(db, me)
         if rows:
             set_busy(db, me, reading(rows))  # printing this wakes the session
-            print(render_inbound(me, rows))
+            print(render_inbound(db, me, rows))
             print(restart_hint())
             return
         time.sleep(1)
@@ -601,7 +680,7 @@ def hook():
     set_busy(db, me, prompt or "Working on a prompt")
     rows = take_unread(db, me)
     if rows:
-        print(render_inbound(me, rows))
+        print(render_inbound(db, me, rows))
 
 
 def reading(rows):
@@ -671,11 +750,11 @@ def relay_to_human(db, me, data):
         text = last_response(data.get("transcript_path"))
     if not text:
         return
-    asked = db.execute("SELECT channel FROM messages WHERE id = ?", (row["pending_human"],)).fetchone()
+    asked = db.execute("SELECT channel, room FROM messages WHERE id = ?", (row["pending_human"],)).fetchone()
     now = time.time()
-    db.execute(  # answer where the human asked: their DM, or #everyone
-        "INSERT INTO messages (sender, recipient, body, reply_to, created, read_at, channel) VALUES (?, 'human', ?, ?, ?, ?, ?)",
-        (me, text[:20000], row["pending_human"], now, now, asked["channel"] if asked else 0),
+    db.execute(  # answer where the human asked: their DM, #everyone or a private channel
+        "INSERT INTO messages (sender, recipient, body, reply_to, created, read_at, channel, room) VALUES (?, 'human', ?, ?, ?, ?, ?, ?)",
+        (me, text[:20000], row["pending_human"], now, now, asked["channel"] if asked else 0, asked["room"] if asked else None),
     )
     db.execute("UPDATE peers SET pending_human = NULL WHERE name = ?", (me,))
 
@@ -688,7 +767,7 @@ def stop():
     relay_to_human(db, me, data)
     rows = take_unread(db, me)
     if rows:
-        reason = render_inbound(me, rows)
+        reason = render_inbound(db, me, rows)
         set_busy(db, me, reading(rows))
     elif not listener_alive(db, me) and not data.get("stop_hook_active"):
         reason = f"The bridge listener is not running. Run `{LISTEN_CMD}` with the Bash tool, run_in_background=true, then stop."
@@ -734,8 +813,10 @@ def gui_state(since, first=0):
             "SELECT id, pinned FROM messages WHERE pinned IS NOT NULL AND deleted IS NULL")]
         deleted = [r["id"] for r in db.execute("SELECT id FROM messages WHERE deleted IS NOT NULL AND id >= ?", (first,))]
         oldest = db.execute("SELECT MIN(id) FROM messages WHERE deleted IS NULL").fetchone()[0] or 0
+        channels = [{"name": r["name"], "members": json.loads(r["members"]), "created": r["created"]}
+                    for r in db.execute("SELECT * FROM channels ORDER BY name")]
         return {"now": now, "peers": peers, "messages": messages, "unread": unread, "notes": notes,
-                "reactions": reactions, "pins": pins, "deleted": deleted, "oldest": oldest}
+                "reactions": reactions, "pins": pins, "deleted": deleted, "oldest": oldest, "channels": channels}
     finally:
         db.close()
 
@@ -789,14 +870,23 @@ def gui_search(query, limit=50):
         db.close()
 
 
-def gui_send(to, body, reply_to=None, channel=False, images=None, everyone=False):
+def gui_send(to, body, reply_to=None, channel=False, images=None, everyone=False, room=None):
     """Send as the human. `to` is a peer name, a list of them (@mentions in #everyone), or '*'.
-    '*' skips quiet sessions unless `everyone` (an explicit @everyone). `images` are GUI uploads: [{name, data: base64}]."""
+    '*' skips quiet sessions unless `everyone` (an explicit @everyone). `images` are GUI uploads: [{name, data: base64}].
+    In a private channel (`room`), '*' is all its members and nobody else can be addressed."""
     db = connect()
     try:
         peers = db.execute("SELECT name, quiet FROM peers").fetchall()
         names = [r["name"] for r in peers]
-        if to == "*":
+        if room:
+            names = channel_members(db, room)
+            if names is None:
+                raise ValueError(f"There's no channel #{room}")
+        if room and to == "*":
+            recipients = names
+            if not recipients:
+                raise ValueError(f"#{room} has nobody in it")
+        elif to == "*":
             recipients = [r["name"] for r in peers if everyone or not r["quiet"]]
             if not recipients:
                 raise ValueError("Every session skips posts to everyone; @mention the one you want.")
@@ -806,13 +896,14 @@ def gui_send(to, body, reply_to=None, channel=False, images=None, everyone=False
         if not body.strip() and not images:
             raise ValueError("Empty message")
         if not recipients or unknown:
-            raise ValueError(f"Unknown peer '{unknown[0] if unknown else to}'")
+            raise ValueError(f"'{unknown[0]}' isn't in #{room}" if room and unknown else
+                             f"Unknown peer '{unknown[0] if unknown else to}'")
         files = store_uploads(images)
         now = time.time()
         return [db.execute(
-            "INSERT INTO messages (sender, recipient, body, reply_to, created, channel, attachments) "
-            "VALUES ('human', ?, ?, ?, ?, ?, ?)",
-            (r, body, reply_to, now, int(channel or to == "*"), json.dumps(files) if files else None),
+            "INSERT INTO messages (sender, recipient, body, reply_to, created, channel, attachments, room) "
+            "VALUES ('human', ?, ?, ?, ?, ?, ?, ?)",
+            (r, body, reply_to, now, int(channel or to == "*" or bool(room)), json.dumps(files) if files else None, room),
         ).lastrowid for r in recipients]
     finally:
         db.close()
@@ -824,6 +915,16 @@ def set_quiet(name, quiet):
     try:
         if not db.execute("UPDATE peers SET quiet = ? WHERE name = ?", (int(quiet), name)).rowcount:
             raise ValueError(f"Unknown peer '{name}'")
+    finally:
+        db.close()
+
+
+def gui_channel(name, members):
+    db = connect()
+    try:
+        if not isinstance(members, list):
+            raise ValueError("Bad members")
+        return {"name": save_channel(db, name, members)}
     finally:
         db.close()
 
@@ -899,7 +1000,7 @@ def post_send(data):
         raise ValueError("Bad images")
     reply_to = int(data["reply_to"]) if data.get("reply_to") else None
     return {"ids": gui_send(to, str(data.get("body", "")), reply_to, bool(data.get("channel")), images,
-                            bool(data.get("everyone")))}
+                            bool(data.get("everyone")), str(data["room"]) if data.get("room") else None)}
 
 
 # What the GUI page can do, by path; each takes the posted JSON object.
@@ -910,6 +1011,7 @@ POST_ROUTES = {
     "/api/pin": lambda d: gui_pin(ids_of(d), bool(d.get("pinned"))),
     "/api/unsend": lambda d: gui_unsend(ids_of(d)),
     "/api/note": lambda d: gui_note(str(d.get("key", "")), str(d.get("value", ""))),
+    "/api/channel": lambda d: gui_channel(str(d.get("name", "")), d.get("members")),
 }
 
 
@@ -1520,6 +1622,23 @@ mark { background: rgba(250, 166, 26, .35); color: inherit; border-radius: 2px; 
 .qs-item .sub { margin-left: 4px; font-size: 13px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: 1; min-width: 0; }
 .qs-item.on { background: var(--sel); }
 .qs-tip { margin-top: 12px; font-size: 12px; color: var(--muted); }
+.section .grow { flex: 1; }
+.section .ib { width: 20px; height: 20px; }
+.section .ib .ic { width: 16px; height: 16px; }
+.intro .btn { flex: none; margin-top: 12px; }
+.chan input { height: 44px; font-size: 16px; }
+.chan-list { margin-top: 10px; max-height: 46vh; overflow-y: auto; }
+.chan-row { display: flex; align-items: center; gap: 10px; padding: 8px 10px; border-radius: 4px; }
+.chan-row:hover { background: var(--hover); }
+.chan-row .avatar { --size: 28px; }
+.chan-row .txt { flex: 1; min-width: 0; }
+.chan-row .txt b { display: block; color: var(--strong); font-weight: 500; }
+.chan-row .txt span { display: block; font-size: 12px; color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.chan-tip { margin-top: 10px; font-size: 13px; color: var(--muted); }
+.chan .bts { display: flex; gap: 8px; margin-top: 14px; }
+.chan .bts .btn { flex: none; }
+.chan .bts .del { margin-right: auto; color: var(--red); }
+.chan .bts .del.armed { background: var(--red); color: #fff; }
 .qs-tip b { color: var(--accent); }
 
 @media (max-width: 1180px) { #members, #profile { display: none !important; } }
@@ -1595,7 +1714,7 @@ mark { background: rgba(250, 166, 26, .35); color: inherit; border-radius: 2px; 
       </div>
       <section class="pane" id="thread" hidden>
         <header class="bar"><span class="bar-icon"><i data-icon="thread"></i></span><span class="title">Thread</span>
-          <span class="topic"># everyone</span><div class="tools">
+          <span class="topic" id="thread-topic"># everyone</span><div class="tools">
           <button type="button" class="ib" id="close-thread" title="Close thread" aria-label="Close thread"><i data-icon="x"></i></button></div></header>
         <div class="log" id="tlog"></div>
         <form id="tcompose">
@@ -1637,13 +1756,32 @@ mark { background: rgba(250, 166, 26, .35); color: inherit; border-radius: 2px; 
     </div>
   </div>
 </div>
+<div class="modal" id="chan-modal" hidden>
+  <form class="qs chan" role="dialog" aria-modal="true" aria-label="Channel">
+    <h3></h3>
+    <input name="name" placeholder="channel-name, e.g. frontend" autocomplete="off" maxlength="40" aria-label="Channel name">
+    <div class="chan-list"></div>
+    <div class="chan-tip"></div>
+    <div class="bts"><button type="button" class="btn del" data-del>Delete channel</button>
+      <button type="button" class="btn" data-cancel>Cancel</button><button class="btn primary" data-ok></button></div>
+  </form>
+</div>
 <div class="lightbox" id="lightbox" hidden><img alt=""><a target="_blank" rel="noopener">Open original</a></div>
 <div id="toasts" aria-live="polite"></div>
 <script>
 const TOKEN = "__TOKEN__";
 const CHANNEL = "#everyone";
 const $ = id => document.getElementById(id);
-let since = 0, view = CHANNEL, thread = null, peers = [], messages = [], notes = [];
+let since = 0, view = CHANNEL, thread = null, peers = [], messages = [], notes = [], channels = [];
+// Views: "#everyone", "#name" for a private channel (only its members get its posts), or a peer name for a DM.
+const isCh = v => !!v && v.startsWith("#");
+const roomOf = v => v === CHANNEL ? null : v.slice(1);
+const chanOf = v => v !== CHANNEL && channels.find(c => "#" + c.name === v) || null;
+// the sessions a post in conversation v can reach
+function reach(v) {
+  const c = chanOf(v);
+  return c ? peers.filter(p => c.members.includes(p.name)) : v === CHANNEL ? peers : peers.filter(p => p.name === v);
+}
 let unread = new Set(), skew = 0, notified = 0, drawn = "", connected = false, newMark = null;
 // reactions by message row id, pinned row ids (-> when), unsent row ids, the oldest message there is
 let reacts = new Map(), pins = new Map(), gone = new Set(), oldest = 0, extraSig = "";
@@ -1659,8 +1797,9 @@ const settings = {theme: "system", density: "cozy", desktop: true, sound: true, 
                   members: true, profile: true, banner: true, collapse: true};
 try { Object.assign(settings, JSON.parse(localStorage.getItem("bridge.settings"))); } catch (e) {}
 {
-  const h = decodeURIComponent(location.hash.slice(1));
-  if (h && !h.startsWith("everyone")) view = h;
+  const h = decodeURIComponent(location.hash.slice(1)), parts = h.split("/");
+  if (parts[0] === "c" && parts[1]) { view = "#" + parts[1]; thread = parseInt(parts[2], 10) || null; }
+  else if (h && !h.startsWith("everyone")) view = h;
   else if (h.startsWith("everyone/")) thread = parseInt(h.split("/")[1], 10) || null;
 }
 
@@ -1848,12 +1987,12 @@ function groups() {
   for (const m of messages) {
     if (gone.has(m.id)) continue;
     const g = out[out.length - 1];
-    if (g && g.sender === m.sender && g.body === m.body && g.channel === !!m.channel
+    if (g && g.sender === m.sender && g.body === m.body && g.channel === !!m.channel && g.room === (m.room || null)
         && Math.abs(g.created - m.created) < 2 && !g.rows.some(r => r.recipient === m.recipient)) {
       g.rows.push(m);
     } else {
       out.push({sender: m.sender, body: m.body, created: m.created, reply_to: m.reply_to, channel: !!m.channel,
-                attachments: m.attachments || [], rows: [m]});
+                room: m.room || null, attachments: m.attachments || [], rows: [m]});
     }
   }
   for (const g of out) {
@@ -1864,8 +2003,9 @@ function groups() {
   return out;
 }
 // Sessions talk in #everyone, addressed with @mentions; so do you when you post there, and their answers
-// come back there. You and one session talk privately in a DM.
+// come back there. You and one session talk privately in a DM. A private channel holds everything posted in it.
 function viewsOf(g) {
+  if (g.room) return ["#" + g.room];
   const withHuman = g.sender === "human" || g.rows[0].recipient === "human";
   if (!withHuman || g.channel || g.sender === "human" && g.everyone) return [CHANNEL];
   return [g.sender === "human" ? g.rows[0].recipient : g.sender];
@@ -1876,12 +2016,12 @@ function model() {
   const all = groups();
   const byRow = new Map();
   for (const g of all) for (const r of g.rows) byRow.set(r.id, g);
-  const inChannel = g => viewsOf(g).includes(CHANNEL);
+  const inChannel = g => isCh(viewsOf(g)[0]);
   const rootOf = g => {
     let cur = g;
     for (let hops = 0; cur.reply_to && hops < 1000; hops++) {
       const parent = byRow.get(cur.reply_to);
-      if (!parent || !inChannel(parent)) break;
+      if (!parent || viewsOf(parent)[0] !== viewsOf(g)[0]) break;
       cur = parent;
     }
     return cur;
@@ -1894,19 +2034,20 @@ function model() {
   }
   return {all, byRow, roots, threads, rootOf, inChannel};
 }
+const rootsIn = (M, v) => M.roots.filter(g => viewsOf(g)[0] === v);
 const threadSeen = key => lastRead["t" + key] ?? lastRead.base ?? 0;
 const fresh = (g, seen) => g.sender !== "human" && g.maxId > seen;
-function dmItems(M, v) { return M.all.filter(g => viewsOf(g)[0] === v && v !== CHANNEL); }
+function dmItems(M, v) { return M.all.filter(g => viewsOf(g)[0] === v && !isCh(v)); }
 function unreadDM(M, v) { return dmItems(M, v).filter(g => fresh(g, lastRead[v] || 0)).length; }
 function unreadThread(M, key) { return (M.threads.get(key) || []).filter(g => fresh(g, threadSeen(key))).length; }
-function unreadChannel(M) {
-  let n = M.roots.filter(g => fresh(g, lastRead[CHANNEL] || 0)).length;
-  for (const key of M.threads.keys()) n += unreadThread(M, key);
+function unreadChannel(M, v = CHANNEL) {
+  let n = rootsIn(M, v).filter(g => fresh(g, lastRead[v] ?? lastRead.base ?? 0)).length;
+  for (const key of M.threads.keys()) if (viewsOf(M.byRow.get(key))[0] === v) n += unreadThread(M, key);
   return n;
 }
 function markRead(M) {
   if (document.hidden) return;
-  const top = view === CHANNEL ? M.roots : dmItems(M, view);
+  const top = isCh(view) ? rootsIn(M, view) : dmItems(M, view);
   if (top.length) lastRead[view] = Math.max(lastRead[view] || 0, ...top.map(g => g.maxId));
   const reps = thread && M.threads.get(thread);
   if (reps && reps.length) lastRead["t" + thread] = Math.max(threadSeen(thread), ...reps.map(g => g.maxId));
@@ -2019,15 +2160,17 @@ function rich(body) {
 // who a channel post is for, minus anyone its text already @mentions
 function targets(g) {
   if (g.rows[0].recipient === "human") return ["You"];
-  const to = new Set(g.rows.map(r => r.recipient));
-  const all = peers.filter(p => p.name !== g.sender && !p.quiet).every(p => to.has(p.name));
+  const to = new Set(g.rows.map(r => r.recipient)), c = g.room && chanOf("#" + g.room);
+  const pool = c ? peers.filter(p => c.members.includes(p.name)) : peers.filter(p => !p.quiet);
+  const all = pool.filter(p => p.name !== g.sender).every(p => to.has(p.name));
   const said = new Set(mentionsIn(g.body));
+  if (all && c) return [];  // the whole channel: that's where it is
   if (all && g.everyone) return said.size ? [] : ["everyone"];
   return [...to].filter(n => !said.has(n));
 }
 
 function sidebarItem(v, iconNode, label, sub, count, extra) {
-  const d = el("div", "item" + (v === CHANNEL ? " ch" : "") + (view === v ? " active" : "") + (count ? " unread" : ""));
+  const d = el("div", "item" + (isCh(v) ? " ch" : "") + (view === v ? " active" : "") + (count ? " unread" : ""));
   const l = el("div", "label");
   l.append(el("div", null, label));
   if (sub) {
@@ -2050,8 +2193,17 @@ function quietIcon(p) {
   return i;
 }
 function renderSidebar(M) {
-  const chCount = unreadChannel(M);
-  $("channels").replaceChildren(sidebarItem(CHANNEL, icon("hash"), "everyone", null, chCount));
+  let chCount = unreadChannel(M);
+  const head = el("div", "section");
+  head.append(el("span", "grow", "Channels"), iconBtn("plus", "Create a channel", () => openChannelEditor()));
+  const rooms = channels.map(c => {
+    const v = "#" + c.name, n = unreadChannel(M, v);
+    chCount += n;
+    const item = sidebarItem(v, icon("hash"), c.name, null, n);
+    item.title = "Private: " + andList(c.members);
+    return item;
+  });
+  $("channels").replaceChildren(head, sidebarItem(CHANNEL, icon("hash"), "everyone", null, unreadChannel(M)), ...rooms);
   let replies = 0;
   $("dms").replaceChildren(...peers.map(p => {
     const n = view === p.name ? 0 : unreadDM(M, p.name);
@@ -2303,8 +2455,8 @@ function renderList(log, items, opts, head) {
       marked = true;
     }
     const cont = !compact && !newDay && !isNew && prev && prev.sender === g.sender && !(opts.preview && g.reply_to)
-                 && g.created - prev.created < 300 && opts.view !== CHANNEL;
-    kids.push(messageEl(g, {...opts, log, stick, cont, receipt: g === mine, threadKey: opts.view === CHANNEL ? g.key : null}));
+                 && g.created - prev.created < 300 && !isCh(opts.view);
+    kids.push(messageEl(g, {...opts, log, stick, cont, receipt: g === mine, threadKey: isCh(opts.view) ? g.key : null}));
     prev = g;
   }
   log.replaceChildren(...kids);
@@ -2312,7 +2464,7 @@ function renderList(log, items, opts, head) {
 }
 
 function renderMain(M) {
-  const dm = view !== CHANNEL, peer = peerOf(view);
+  const dm = !isCh(view), peer = peerOf(view), c = chanOf(view);
   const intro = el("div", "intro");
   if (dm) {
     const a = avatar(view, true);
@@ -2326,6 +2478,15 @@ function renderMain(M) {
       chips.append(f);
     }
     intro.append(a, el("h2", null, view), p, chips);
+  } else if (c) {
+    const big = el("div", "big"), p = el("p"), edit = el("button", "btn");
+    big.append(icon("hash", 40));
+    p.append("A private channel with only ", ...c.members.flatMap((n, i) => [i ? (i === c.members.length - 1 ? " and " : ", ") : "", el("b", null, n)]),
+             ". Your posts here go just to them, and they keep their replies here and can only talk to each other in it.");
+    edit.type = "button";
+    edit.append(icon("users"), "Add or remove sessions");
+    edit.onclick = () => openChannelEditor(c.name);
+    intro.append(big, el("h2", null, "Welcome to #" + c.name), p, edit);
   } else {
     const big = el("div", "big");
     big.append(icon("hash", 40));
@@ -2348,21 +2509,23 @@ function renderMain(M) {
     wrap.append(b);
     head[0] = wrap;
   }
-  renderList($("log"), dm ? dmItems(M, view) : M.roots, {M, view, chips: !dm, preview: true, mark: newMark.id}, head);
+  renderList($("log"), dm ? dmItems(M, view) : rootsIn(M, view), {M, view, chips: !dm, preview: true, mark: newMark.id}, head);
 }
 
 function renderThread(M) {
   const panel = $("thread");
   const root = thread && M.roots.find(g => g.key === thread);
-  if (!root || view !== CHANNEL) { panel.hidden = true; thread = null; return false; }
+  if (!root || viewsOf(root)[0] !== view) { panel.hidden = true; thread = null; return false; }
   panel.hidden = false;
+  $("thread-topic").textContent = "# " + view.slice(1);
   const log = $("tlog"), reps = M.threads.get(thread) || [];
   const stick = log.scrollHeight - log.scrollTop - log.clientHeight < 60;
   const head = [messageEl(root, {M, log, stick, chips: true}),
                 el("div", "tdiv", reps.length ? reps.length + (reps.length === 1 ? " reply" : " replies") : "No replies yet")];
   renderList(log, reps, {M, chips: true, stick, after: root}, head);
   const who = threadPeople(M, root);
-  setHint($("tcompose"), (who.length ? "Goes to " + who.join(", ") : "Goes to every session") + " · @mention to bring in someone else",
+  setHint($("tcompose"), (who.length ? "Goes to " + who.join(", ") : chanOf(view) ? "Goes to everyone in " + view : "Goes to every session")
+          + (chanOf(view) ? " · @mention another member to bring them in" : " · @mention to bring in someone else"),
           working(who));
   return true;
 }
@@ -2375,8 +2538,8 @@ function threadPeople(M, root) {
 }
 
 function renderMembers() {
-  const box = el("div", "members"), by = {busy: [], on: [], idle: [], off: []};
-  for (const p of peers) by[presence(p)].push(p);
+  const box = el("div", "members"), by = {busy: [], on: [], idle: [], off: []}, c = chanOf(view);
+  for (const p of reach(view)) by[presence(p)].push(p);
   for (const k of ["busy", "on", "idle", "off"]) {
     if (!by[k].length) continue;
     box.append(el("div", "section", PRESENCE[k][0] + " — " + by[k].length));
@@ -2395,6 +2558,14 @@ function renderMembers() {
     }
   }
   if (!peers.length) box.append(el("div", "empty", "No sessions have connected yet."));
+  if (c) {
+    const b = el("button", "btn");
+    b.type = "button";
+    b.style.cssText = "flex: none; width: calc(100% - 16px); margin: 12px 8px;";
+    b.append(icon("plus"), "Add or remove sessions");
+    b.onclick = () => openChannelEditor(c.name);
+    box.append(b);
+  }
   $("members").replaceChildren(box);
 }
 
@@ -2436,8 +2607,9 @@ function profileCard(name, docked) {
   }
   const m = el("button", "btn");
   m.type = "button";
-  m.append(icon("at"), view === CHANNEL ? "Mention" : "Mention in #everyone");
-  m.onclick = () => { closePopout(); if (view !== CHANNEL) setView(CHANNEL); mainBox.insert("@" + name + " "); };
+  const here = isCh(view) && reach(view).some(x => x.name === name);
+  m.append(icon("at"), here ? "Mention" : "Mention in #everyone");
+  m.onclick = () => { closePopout(); if (!here) setView(CHANNEL); mainBox.insert("@" + name + " "); };
   acts.append(m);
   body.append(st, info, set, acts);
   return card;
@@ -2469,7 +2641,7 @@ async function setQuiet(p, quiet) {
 // The popover under the header: pinned messages here, shared notes, or search results.
 let panel = null, noteEdit = null, found = {q: "", results: [], total: 0, busy: false};
 function pinnedHere(M) {
-  const here = view === CHANNEL ? M.all.filter(M.inChannel) : dmItems(M, view);
+  const here = isCh(view) ? M.all.filter(g => viewsOf(g)[0] === view) : dmItems(M, view);
   return here.filter(isPinned).sort((a, b) => Math.max(...idsOf(b).map(i => pins.get(i) || 0)) - Math.max(...idsOf(a).map(i => pins.get(i) || 0)));
 }
 // a message as a card in a list (pins, search results); click to jump to it
@@ -2491,7 +2663,7 @@ function hit(m, body, where, extra) {
   d.onclick = ev => { if (!ev.target.closest(".peer, .ib")) { closePanel(); jump(m.id); } };
   return d;
 }
-const whereOf = m => m.sender !== "human" && m.recipient !== "human" || m.channel ? "#everyone"
+const whereOf = m => m.room ? "#" + m.room : m.sender !== "human" && m.recipient !== "human" || m.channel ? "#everyone"
   : "DM with " + (m.sender === "human" ? m.recipient : m.sender);
 // the text with each search word highlighted, trimmed to the part around the first match
 function highlight(body, words) {
@@ -2506,7 +2678,7 @@ function highlight(body, words) {
 const PANELS = {
   pinned() {
     const M = model(), list = pinnedHere(M), box = el("div", "pins"), head = el("div", "pins-head"), body = el("div", "pins-list");
-    head.append(icon("pin"), "Pinned messages", el("span", null, view === CHANNEL ? "in #everyone" : "with " + view));
+    head.append(icon("pin"), "Pinned messages", el("span", null, isCh(view) ? "in " + view : "with " + view));
     for (const g of list) {
       const m = {...g.rows[0], attachments: g.attachments};
       body.append(hit(m, [g.body], null, iconBtn("x", "Unpin", () => pin(g, false))));
@@ -2551,7 +2723,7 @@ const PANELS = {
                 el("span", null, found.total > found.results.length ? "showing the newest " + found.results.length : ""));
     for (const m of found.results) {
       const to = m.to.filter(n => n !== "human");
-      const where = whereOf(m) + (m.sender !== "human" && to.length && whereOf(m) === "#everyone" ? " → " + andList(to) : "");
+      const where = whereOf(m) + (m.sender !== "human" && to.length && whereOf(m).startsWith("#") ? " → " + andList(to) : "");
       list.append(hit(m, highlight(m.body, words), where));
     }
     if (!found.busy && !found.results.length) {
@@ -2640,12 +2812,14 @@ async function search(q) {
 }
 
 function renderHeader() {
-  const dm = view !== CHANNEL, peer = peerOf(view);
+  const dm = !isCh(view), peer = peerOf(view), c = chanOf(view);
   if (dm) $("bar-icon").replaceChildren(avatar(view, true));
   else $("bar-icon").replaceChildren(icon("hash", 24));
-  $("title").textContent = dm ? view : "everyone";
-  $("topic").textContent = dm ? (peer && (peer.summary || peer.cwd) || "") : "Sessions coordinating with each other";
+  $("title").textContent = dm ? view : view.slice(1);
+  $("topic").textContent = dm ? (peer && (peer.summary || peer.cwd) || "") : c ? "Private · " + andList(c.members)
+    : "Sessions coordinating with each other";
   const tools = [];
+  if (c) tools.push(iconBtn("pencil", "Edit channel", () => openChannelEditor(c.name)));
   if (dm && peer) tools.push(iconBtn(peer.quiet ? "bell-off" : "bell",
     peer.quiet ? view + " skips posts to everyone. Click to include it." : view + " gets posts to everyone. Click to skip them (@mentions still reach it).",
     () => setQuiet(peer, !peer.quiet), peer.quiet ? "alert" : ""));
@@ -2677,36 +2851,37 @@ function notify(M) {
   let chimed = false;
   for (const g of news) {
     const root = M.inChannel(g) ? M.rootOf(g) : null;
-    const where = root ? CHANNEL : g.sender, inThread = root && root !== g ? root.key : null;
+    const where = root ? viewsOf(root)[0] : g.sender, inThread = root && root !== g ? root.key : null;
     if (!document.hidden && view === where && (!inThread || thread === inThread)) continue;
     if (settings.sound && !chimed) { ping(); chimed = true; }
     if (!settings.desktop || !("Notification" in window) || Notification.permission !== "granted") continue;
     const toMe = g.rows.some(r => r.recipient === "human");
-    const n = new Notification(g.sender + (toMe ? " replied" : " posted") + (root ? " in #everyone" : ""),
+    const n = new Notification(g.sender + (toMe ? " replied" : " posted") + (root ? " in " + where : ""),
                                {body: g.body.slice(0, 200) || "Sent an image", tag: "bridge-" + g.key});
     n.onclick = () => { window.focus(); setView(where); if (inThread) openThread(inThread); n.close(); };
   }
 }
 
 const peerSig = () => peers.map(p => [p.name, presence(p), p.summary, p.cwd, p.quiet, p.activity]);
-const sig = () => JSON.stringify([since, extraSig, messages.length, [...unread], peerSig(), notes, view, thread, connected,
+const sig = () => JSON.stringify([since, extraSig, messages.length, [...unread], peerSig(), notes, channels, view, thread, connected,
                                   Math.floor(serverNow() / 60)]);
 function render() {
-  if (view !== CHANNEL && !peerOf(view)) view = CHANNEL;
+  if (view !== CHANNEL && !chanOf(view) && !peerOf(view)) view = CHANNEL;
   drawn = sig();
-  const M = model(), dm = view !== CHANNEL;
+  const M = model(), dm = !isCh(view), c = chanOf(view);
   // The NEW line marks what arrived since you last looked at this view. It stays put while you're here, and
   // isn't drawn for messages that arrive while you watch.
   if (!newMark || newMark.view !== view || document.hidden) {
     const seen = lastRead[view] ?? lastRead.base ?? 0;
-    newMark = {view, id: (dm ? dmItems(M, view) : M.roots).some(g => fresh(g, seen)) ? seen : Infinity};
+    newMark = {view, id: (dm ? dmItems(M, view) : rootsIn(M, view)).some(g => fresh(g, seen)) ? seen : Infinity};
   }
   markRead(M);
-  mainBox.input.placeholder = dm ? "Message @" + view : "Message #everyone";
+  mainBox.input.placeholder = dm ? "Message @" + view : "Message " + view;
   const quiet = peers.filter(p => p.quiet).map(p => p.name);
   setHint($("compose"), dm ? "Only " + view + " sees this · type / for commands"
+    : c ? "Only " + andList(c.members) + " see this · @mention one to ask just them · / for commands"
     : "@mention sessions to ask just them" + (quiet.length ? " · without one, it skips " + quiet.join(", ") : "") + " · / for commands",
-    working(dm ? [view] : peers.map(p => p.name)));
+    working(reach(view).map(p => p.name)));
   renderHeader();
   renderSidebar(M);
   renderMe();
@@ -2725,12 +2900,13 @@ function render() {
 const refresh = () => render();
 
 function setHash() {
-  history.replaceState(null, "", view !== CHANNEL ? "#" + encodeURIComponent(view) : thread ? "#everyone/" + thread : "#everyone");
+  const where = view === CHANNEL ? "everyone" : "c/" + encodeURIComponent(view.slice(1));
+  history.replaceState(null, "", !isCh(view) ? "#" + encodeURIComponent(view) : "#" + where + (thread ? "/" + thread : ""));
 }
 function setView(v) {
   if (v !== view && panel === "pinned") closePanel();
+  if (v !== view) thread = null;
   view = v;
-  if (v !== CHANNEL) thread = null;
   setHash();
   mainBox.restore();
   render();
@@ -2738,7 +2914,8 @@ function setView(v) {
   mainBox.input.focus();
 }
 function openThread(key) {
-  view = CHANNEL;
+  const root = model().byRow.get(key);
+  view = root ? viewsOf(root)[0] : CHANNEL;
   thread = key;
   setHash();
   sideBox.restore();
@@ -2775,7 +2952,7 @@ async function jump(id) {
   if (M.inChannel(g)) {
     const root = M.rootOf(g);
     if (root !== g) { openThread(root.key); log = $("tlog"); }
-    else if (view !== CHANNEL) setView(CHANNEL);
+    else if (view !== viewsOf(g)[0]) setView(viewsOf(g)[0]);
   } else if (view !== viewsOf(g)[0]) setView(viewsOf(g)[0]);
   const t = findIn(log, id) || findIn($("tlog"), id);
   if (!t) return;
@@ -2958,6 +3135,7 @@ document.addEventListener("keydown", ev => {
   if (ev.key !== "Escape") return;
   if (!$("lightbox").hidden) $("lightbox").hidden = true;
   else if (!$("switcher").hidden) $("switcher").hidden = true;
+  else if (!$("chan-modal").hidden) $("chan-modal").hidden = true;
   else if (!$("picker").hidden) closePicker();
   else if (!$("popout").hidden) closePopout();
   else if (!$("pins").hidden) closePanel();
@@ -2975,12 +3153,12 @@ $("log").addEventListener("scroll", () => {
 }, {passive: true});
 
 // Conversations in sidebar order; Alt+arrows walk them, Ctrl/⌘+K searches them.
-const conversations = () => [CHANNEL, ...peers.map(p => p.name)];
+const conversations = () => [CHANNEL, ...channels.map(c => "#" + c.name), ...peers.map(p => p.name)];
 function step(dir, unreadOnly) {
   const list = conversations(), M = model(), i = list.indexOf(view);
   for (let k = 1; k < list.length; k++) {
     const v = list[(i + dir * k + list.length * k) % list.length];
-    if (!unreadOnly || (v === CHANNEL ? unreadChannel(M) : unreadDM(M, v))) return setView(v);
+    if (!unreadOnly || (isCh(v) ? unreadChannel(M, v) : unreadDM(M, v))) return setView(v);
   }
   if (unreadOnly) toast("Nothing unread anywhere else");
 }
@@ -2998,9 +3176,9 @@ function openSwitcher() {
 function switcherItems() {
   const q = $("switcher").querySelector("input").value.trim().toLowerCase().replace(/^[#@]/, ""), M = model();
   return conversations().map(v => {
-    const p = peerOf(v);
-    return {v, name: v === CHANNEL ? "everyone" : v, sub: p ? p.busy_since ? "Working…" : p.summary || p.cwd : "every session",
-            n: v === CHANNEL ? unreadChannel(M) : unreadDM(M, v)};
+    const p = peerOf(v), c = chanOf(v);
+    return {v, name: isCh(v) ? v.slice(1) : v, sub: p ? p.busy_since ? "Working…" : p.summary || p.cwd : c ? andList(c.members) : "every session",
+            n: isCh(v) ? unreadChannel(M, v) : unreadDM(M, v)};
   }).filter(o => !q || o.name.toLowerCase().includes(q) || o.sub.toLowerCase().includes(q))
     .sort((a, b) => !q ? 0 : b.name.toLowerCase().startsWith(q) - a.name.toLowerCase().startsWith(q));
 }
@@ -3009,8 +3187,8 @@ function renderSwitcher() {
   qsIndex = Math.max(0, Math.min(qsIndex, items.length - 1));
   list.replaceChildren(...items.map((o, i) => {
     const d = el("div", "qs-item" + (i === qsIndex ? " on" : ""));
-    const ic = o.v === CHANNEL ? el("span", "hash") : avatar(o.v, true);
-    if (o.v === CHANNEL) ic.append(icon("hash", 18));
+    const ic = isCh(o.v) ? el("span", "hash") : avatar(o.v, true);
+    if (isCh(o.v)) ic.append(icon("hash", 18));
     d.append(ic, el("b", null, o.name), el("span", "sub", o.sub));
     if (o.n) d.append(el("span", "pill", o.n > 99 ? "99+" : String(o.n)));
     d.onmousedown = ev => { ev.preventDefault(); $("switcher").hidden = true; setView(o.v); };
@@ -3036,6 +3214,83 @@ function renderSwitcher() {
   $("switcher").onmousedown = ev => { if (ev.target === ev.currentTarget) $("switcher").hidden = true; };
 }
 
+// --- private channels: you pick which sessions are in one; its posts reach only them ---
+let chanEdit = null;  // {name, members: Set, isNew}
+function openChannelEditor(name) {
+  const c = name && chanOf("#" + name), f = $("chan-modal").querySelector("form");
+  chanEdit = {name: c ? c.name : "", members: new Set(c ? c.members : []), isNew: !c};
+  closePopout();
+  closePanel();
+  f.elements.name.value = chanEdit.name;
+  $("chan-modal").hidden = false;
+  renderChannelEditor();
+  (chanEdit.isNew ? f.elements.name : f.querySelector("[data-ok]")).focus();
+}
+function renderChannelEditor() {
+  const f = $("chan-modal").querySelector("form"), e = chanEdit;
+  f.querySelector("h3").textContent = e.isNew ? "Create a private channel" : "Sessions in #" + e.name;
+  f.elements.name.hidden = !e.isNew;
+  f.querySelector("[data-del]").hidden = e.isNew;
+  f.querySelector("[data-ok]").textContent = e.isNew ? "Create channel" : "Save";
+  f.querySelector(".chan-list").replaceChildren(...peers.map(p => {
+    const r = el("div", "chan-row"), t = el("div", "txt");
+    t.append(el("b", null, p.name), el("span", null, p.summary || p.cwd));
+    r.append(avatar(p.name, true), t, toggle(e.members.has(p.name), on => {
+      on ? e.members.add(p.name) : e.members.delete(p.name);
+      renderChannelEditor();
+    }, p.name + " is in the channel"));
+    return r;
+  }));
+  if (!peers.length) f.querySelector(".chan-list").append(el("div", "empty", "No sessions have connected yet."));
+  f.querySelector(".chan-tip").textContent = e.members.size
+    ? "Only " + andList([...e.members]) + " will get posts here, and in it they can only talk to each other."
+    : "Pick the sessions to pull into the channel.";
+}
+async function saveChannel(name, members, isNew) {
+  const r = await api("/api/channel", {name, members});
+  const c = chanOf("#" + r.name);
+  if (c) c.members = members; else channels.push({name: r.name, members, created: serverNow()});
+  toast((isNew ? "Created #" : "Saved #") + r.name);
+  setView("#" + r.name);
+  poll();
+}
+{
+  const f = $("chan-modal").querySelector("form");
+  f.elements.name.oninput = () => {
+    chanEdit.name = f.elements.name.value = f.elements.name.value.toLowerCase().replace(/\s+/g, "-").replace(/[^a-z0-9_-]/g, "");
+  };
+  f.querySelector("[data-cancel]").onclick = () => { $("chan-modal").hidden = true; };
+  $("chan-modal").onmousedown = ev => { if (ev.target === ev.currentTarget) $("chan-modal").hidden = true; };
+  f.onsubmit = async ev => {
+    ev.preventDefault();
+    const e = chanEdit;
+    if (!e.name) return toast("Give the channel a name.", true);
+    if (!e.members.size) return toast("Pick at least one session.", true);
+    try {
+      await saveChannel(e.name, [...e.members], e.isNew);
+      $("chan-modal").hidden = true;
+    } catch (err) { toast("Couldn't save it: " + err.message, true); }
+  };
+  // the first click arms the button, a second one deletes
+  f.querySelector("[data-del]").onclick = async ev => {
+    const b = ev.currentTarget, name = chanEdit.name;
+    if (!b.classList.contains("armed")) {
+      b.classList.add("armed");
+      b.textContent = "Click again to delete";
+      setTimeout(() => { b.classList.remove("armed"); b.textContent = "Delete channel"; }, 4000);
+      return;
+    }
+    try {
+      await api("/api/channel", {name, members: []});
+      channels = channels.filter(c => c.name !== name);
+      $("chan-modal").hidden = true;
+      toast("Deleted #" + name);
+      if (view === "#" + name) setView(CHANNEL);
+      poll();
+    } catch (err) { toast("Couldn't delete it: " + err.message, true); }
+  };
+}
+
 // One poll at a time: a poll asked for while another runs (say, right after you react) runs straight after it.
 let pollTimer = null, polling = null, pollAgain = false;
 async function poll() {
@@ -3054,6 +3309,7 @@ async function pollOnce() {
     skew = Date.now() / 1000 - s.now;
     peers = s.peers;
     notes = s.notes;
+    channels = s.channels || [];
     connected = true;
     messages.push(...s.messages);
     if (s.messages.length) since = s.messages[s.messages.length - 1].id;
@@ -3108,9 +3364,14 @@ const COMMANDS = [
     if (!p) throw new Error("Usage: /quiet session");
     return setQuiet(p, !p.quiet);
   }],
-  ["go", "conversation", "Jump to #everyone or a session's DM", a => {
+  ["channel", "name session…", "Make a private channel with just these sessions", async a => {
+    const [name, ...who] = a.split(/\s+/).filter(Boolean).map(w => w.replace(/^[#@]/, ""));
+    if (!name || !who.length) return openChannelEditor();
+    await saveChannel(name, who, !chanOf("#" + name.toLowerCase()));
+  }],
+  ["go", "conversation", "Jump to #everyone, a channel or a session's DM", a => {
     const q = a.replace(/^[#@]/, "").trim().toLowerCase();
-    const v = q === "everyone" ? CHANNEL : (peers.find(p => p.name.toLowerCase() === q) || peers.find(p => p.name.toLowerCase().startsWith(q)) || {}).name;
+    const v = q === "everyone" ? CHANNEL : chanOf("#" + q) ? "#" + q : (peers.find(p => p.name.toLowerCase() === q) || peers.find(p => p.name.toLowerCase().startsWith(q)) || {}).name;
     if (!v) throw new Error("No conversation called " + a);
     setView(v);
   }],
@@ -3172,7 +3433,8 @@ function composer(form, payload, canMention, dropZone, draftKey) {
     if (!cmd && !m) return close();
     const q = (cmd ? cmd[1] : m[2]).toLowerCase();
     const opts = cmd ? COMMANDS.filter(c => c[0].startsWith(q)).map(c => ({name: c[0], args: c[1], sub: c[2], cmd: true}))
-      : [...peers.map(p => ({name: p.name, sub: p.summary || p.cwd})), {name: "everyone", sub: "every session"}]
+      : [...reach(view).map(p => ({name: p.name, sub: p.summary || p.cwd})),
+         {name: "everyone", sub: chanOf(view) ? "everyone in " + view : "every session"}]
         .filter(o => o.name.toLowerCase().startsWith(q));
     if (!opts.length) return close();
     menu = {items: opts, index: Math.min(menu.index, opts.length - 1), start: before.length - q.length - 1};
@@ -3280,17 +3542,17 @@ function composer(form, payload, canMention, dropZone, draftKey) {
   return {input, insert, restore};
 }
 const mainBox = composer($("compose"), body => {
-  if (view !== CHANNEL) return {to: view, body};
+  if (!isCh(view)) return {to: view, body};
   const tagged = mentionsIn(body);
   const everyone = tagged.includes("everyone");
-  return {to: !tagged.length || everyone ? "*" : tagged, everyone, body, channel: true};
-}, () => view === CHANNEL, document.querySelector(".chat"), () => view);
+  return {to: !tagged.length || everyone ? "*" : tagged, everyone, body, channel: true, room: roomOf(view)};
+}, () => isCh(view), document.querySelector(".chat"), () => view);
 const sideBox = composer($("tcompose"), body => {
   const M = model(), root = M.roots.find(g => g.key === thread);
   const reps = M.threads.get(thread) || [], last = reps.length ? reps[reps.length - 1] : root;
   const tagged = mentionsIn(body), who = threadPeople(M, root);
   const to = tagged.includes("everyone") ? "*" : tagged.length ? tagged : who.length ? who : "*";
-  return {to, body, channel: true, reply_to: last.rows[0].id};
+  return {to, body, channel: true, reply_to: last.rows[0].id, room: roomOf(view)};
 }, () => true, $("thread"), () => "t" + thread);
 
 for (const i of document.querySelectorAll("i[data-icon]")) i.replaceWith(icon(i.dataset.icon));
@@ -3331,6 +3593,13 @@ def cli(argv):
         except ValueError as e:
             sys.exit(f"Error: {e}")
         print(f"{argv[1]} {'skips' if on else 'gets'} messages to everyone; @mentions always reach it.")
+    elif cmd == "channel" and len(argv) >= 2:
+        db = connect()
+        try:
+            name = save_channel(db, argv[1], argv[2:])
+        except ValueError as e:
+            sys.exit(f"Error: {e}")
+        print(f"#{name}: {', '.join(argv[2:])}." if argv[2:] else f"Deleted #{name}.")
     elif cmd == "post":
         import argparse
         p = argparse.ArgumentParser(prog="bridge.py post", description="Send as the session that owns this folder.")
@@ -3338,9 +3607,10 @@ def cli(argv):
         p.add_argument("message")
         p.add_argument("--image", action="append", default=[], help="image to attach (repeatable)")
         p.add_argument("--reply-to", type=int)
+        p.add_argument("--channel", help="private channel to post in")
         a = p.parse_args(argv[1:])
         try:
-            print(Bridge(os.getcwd()).send(a.to, a.message, a.reply_to, a.image))
+            print(Bridge(os.getcwd()).send(a.to, a.message, a.reply_to, a.image, a.channel))
         except ValueError as e:
             sys.exit(f"Error: {e}")
     elif cmd == "send" and len(argv) >= 3:
