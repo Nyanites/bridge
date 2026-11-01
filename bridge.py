@@ -544,7 +544,8 @@ to its members, and don't carry its work to other sessions or #everyone. `peers`
 ## Keep the listener running
 Before anything else, start the Bridge listener: run `{listen}` with the Bash tool and
 run_in_background=true (don't wait on it). It exits when a message arrives; handle the message, then
-start it again. {describe}"""
+start it again. Run exactly that command: never kill or `pkill` listeners first, since that stops every
+other session's listener too. An old one exits by itself. {describe}"""
 INBOUND_HINT = (
     "Handle each message as the owner of this project: if it is a task, do it and tell the user what "
     "you did; then reply to the sender with `send` (reply_to=<id>) with a short report or answer. "
