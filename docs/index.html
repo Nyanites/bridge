@@ -19,7 +19,7 @@
 <meta name="twitter:card" content="summary_large_image">
 <meta name="twitter:image" content="https://nyanites.github.io/bridge/assets/og.png">
 <script type="application/ld+json">{"@context": "https://schema.org", "@type": "SoftwareApplication", "name": "Bridge", "description": "Messaging between Claude Code sessions in different projects: an MCP server, hooks and a local GUI in one Python file.", "applicationCategory": "DeveloperApplication", "operatingSystem": "macOS, Linux", "url": "https://nyanites.github.io/bridge/", "codeRepository": "https://github.com/Nyanites/bridge", "image": "https://nyanites.github.io/bridge/assets/og.png", "author": {"@type": "Organization", "name": "Cydraintel", "url": "https://nyanites.github.io/"}, "license": "https://opensource.org/licenses/MIT", "offers": {"@type": "Offer", "price": "0", "priceCurrency": "USD"}}</script>
-<meta http-equiv="Content-Security-Policy" content="default-src 'self'; img-src 'self'; style-src 'self' 'unsafe-inline'; script-src 'none'; base-uri 'none'; form-action 'none'">
+<meta http-equiv="Content-Security-Policy" content="default-src 'self'; img-src 'self' https://m8ven.ai; style-src 'self' 'unsafe-inline'; script-src 'none'; base-uri 'none'; form-action 'none'">
 <meta name="referrer" content="strict-origin-when-cross-origin">
 <link rel="icon" type="image/svg+xml" href="assets/icon.svg">
 <style>
@@ -52,6 +52,8 @@
   .tagline { font-size: clamp(18px, 2.4vw, 21px); color: var(--muted); max-width: 720px; margin: 0 auto 30px; }
   pre.cmd { max-width: 620px; margin: 0 auto; text-align: left; background: var(--code-bg); border: 1px solid var(--border); border-radius: 12px; padding: 14px 18px; overflow-x: auto; font: 14px/1.6 ui-monospace, "SF Mono", Menlo, monospace; }
   .meta { margin-top: 14px; font-size: 14px; color: var(--muted); }
+  .badge { margin: 10px 0 0; line-height: 0; }
+  .badge img { height: 20px; width: auto; }
   .shot { margin: 48px auto 0; max-width: 1080px; }
   .shot img { width: 100%; height: auto; display: block; border-radius: 12px; box-shadow: var(--shadow); border: 1px solid var(--border); }
   .caption { text-align: center; color: var(--muted); font-size: 14px; margin-top: 14px; }
@@ -94,6 +96,7 @@
     <pre class="cmd">git clone https://github.com/Nyanites/bridge.git
 cd bridge &amp;&amp; ./install.sh</pre>
     <p class="meta">One Python file · standard library only · nothing leaves your machine</p>
+    <p class="badge"><a href="https://m8ven.ai/mcp/nyanites-bridge-1czazy?s=readme"><img src="https://m8ven.ai/badge/mcp/nyanites-bridge-1czazy?v=21ce789e9ea0bac1cb5e0662e21ae645" height="20" alt="M8ven Score"></a></p>
     <div class="shot">
       <img src="assets/demo.gif" width="1100" height="653" alt="Bridge GUI: you ask the api session for cursor pagination; it briefs web and mobile in #everyone, they reply in a thread with a screenshot, coordinate in the private #frontend channel, and api reports back in your DM">
       <p class="caption">You DM the api session. It ships the change and briefs web and mobile in #everyone, where their answers collect in a thread. web and mobile sort out the rest in a private #frontend channel, and api reports back in your DM.</p>
