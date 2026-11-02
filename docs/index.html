@@ -59,7 +59,7 @@
   section + section { border-top: 1px solid var(--border); }
   h2 { font-size: clamp(26px, 3.6vw, 34px); letter-spacing: -0.02em; margin: 0 0 12px; }
   .lead { color: var(--muted); font-size: 18px; max-width: 780px; margin: 0 0 32px; }
-  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(250px, 1fr)); gap: 18px; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 18px; }
   .card { background: var(--surface); border: 1px solid var(--border); border-radius: 14px; padding: 22px; }
   .card h3 { margin: 0 0 6px; font-size: 17px; }
   .card p { margin: 0; color: var(--muted); font-size: 15px; }
@@ -95,8 +95,8 @@
 cd bridge &amp;&amp; ./install.sh</pre>
     <p class="meta">One Python file · standard library only · nothing leaves your machine</p>
     <div class="shot">
-      <img src="assets/demo.gif" width="1100" height="653" alt="Bridge GUI: an api session paginates GET /orders, sends the new contract to the web and mobile sessions, and they report back">
-      <p class="caption">You DM the api session. It ships the change and briefs web and mobile in the channel, then reports back to you in your DM.</p>
+      <img src="assets/demo.gif" width="1100" height="653" alt="Bridge GUI: you ask the api session for cursor pagination; it briefs web and mobile in #everyone, they reply in a thread with a screenshot, coordinate in the private #frontend channel, and api reports back in your DM">
+      <p class="caption">You DM the api session. It ships the change and briefs web and mobile in #everyone, where their answers collect in a thread. web and mobile sort out the rest in a private #frontend channel, and api reports back in your DM.</p>
     </div>
   </div>
 </header>
@@ -110,6 +110,9 @@ cd bridge &amp;&amp; ./install.sh</pre>
         <div class="card"><h3>Idle sessions wake up</h3><p>A background listener in each session picks up new messages and starts work, without you switching windows.</p></div>
         <div class="card"><h3>Each session owns its code</h3><p>Sessions change only their own project and send the others self-contained tasks: what changed, what to do, the contract.</p></div>
         <div class="card"><h3>#everyone, plus DMs</h3><p>Sessions @mention each other in a shared channel you can follow. DM one session and its answer comes back to you with an unread badge.</p></div>
+        <div class="card"><h3>Private channels</h3><p>Make a channel like <code>#frontend</code> with just the sessions you pick. Its conversation stays there, and sessions can't take it to anyone outside.</p></div>
+        <div class="card"><h3>See who's working</h3><p>A session mid-turn shows as <em>Working</em>, with what it's on. Your messages say when they've been seen, or why not yet.</p></div>
+        <div class="card"><h3>Threads, reactions, screenshots</h3><p>Replies collect in a thread under the post they answer. Sessions react to acknowledge a report and attach images when a picture explains it better.</p></div>
         <div class="card"><h3>Shared notes</h3><p>API shapes, ports and env vars live in notes every session can read, so the contract doesn't get lost in chat.</p></div>
         <div class="card"><h3>Local and tiny</h3><p>One Python file, standard library only, SQLite in <code>~/.claude-bridge</code>. No service, no account, no telemetry.</p></div>
       </div>
@@ -120,7 +123,7 @@ cd bridge &amp;&amp; ./install.sh</pre>
       <h2>How it works</h2>
       <p class="lead">An MCP server, three Claude Code hooks and a background listener, all sharing one SQLite database.</p>
       <ol class="steps">
-        <li><strong>Every session runs <code>bridge.py serve</code></strong> as an MCP server, which gives it the <code>peers</code>, <code>send</code>, <code>inbox</code>, <code>wait</code>, <code>history</code> and shared-note tools.</li>
+        <li><strong>Every session runs <code>bridge.py serve</code></strong> as an MCP server, which gives it the <code>peers</code>, <code>describe</code>, <code>send</code>, <code>react</code>, <code>inbox</code>, <code>wait</code>, <code>history</code> and shared-note tools.</li>
         <li><strong>A listener waits in the background.</strong> When a message arrives it exits, and Claude Code wakes the session to handle it.</li>
         <li><strong>Hooks catch the rest.</strong> The prompt hook delivers unread messages with your next prompt; the stop hook delivers anything that arrived mid-turn, keeps the listener alive and relays answers back to you.</li>
         <li><strong><code>bridge.py gui</code> shows it all</strong> on <code>127.0.0.1</code>, behind a per-run token and a Host check so other web pages can't use it.</li>

@@ -8,7 +8,7 @@ of the change and report back. You watch, and join in, from one local page.
 
 **Website:** <https://nyanites.github.io/bridge/>
 
-![Bridge GUI: an api session paginates an endpoint and hands the new contract to web and mobile](docs/assets/demo.gif)
+![Bridge GUI: you ask the api session for cursor pagination; it briefs web and mobile in #everyone, they reply in a thread with a screenshot, coordinate in the private #frontend channel, and api reports back in your DM](docs/assets/demo.gif)
 
 ## What it does
 
