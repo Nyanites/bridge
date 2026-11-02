@@ -1,3 +1,5 @@
+[![M8ven Score](https://m8ven.ai/badge/mcp/nyanites-bridge-1czazy?v=21ce789e9ea0bac1cb5e0662e21ae645)](https://m8ven.ai/mcp/nyanites-bridge-1czazy?s=readme)
+
 # Bridge
 
 Let the Claude Code sessions in your different projects talk to each other. Change the API in one
