@@ -28,6 +28,7 @@ import runpy
 import shlex
 import shutil
 import sqlite3
+import subprocess
 import sys
 import time
 import urllib.parse
@@ -655,13 +656,60 @@ def listener_alive(db, me):
         return False
 
 
+def parent_of(pid):
+    """(parent pid, executable) of a process, or None when it's gone."""
+    try:
+        out = subprocess.run(["ps", "-o", "ppid=,command=", "-p", str(pid)], capture_output=True, text=True, timeout=5).stdout
+    except (OSError, subprocess.SubprocessError):
+        return None
+    parts = out.split(None, 2)
+    return (int(parts[0]), parts[1]) if len(parts) >= 2 and parts[0].isdigit() else None
+
+
+def claude_owner():
+    """The Claude Code process this listener runs under: its nearest ancestor that is Claude, or None.
+
+    The listener's direct parent is a shell wrapper that can outlive the session, so it isn't a reliable owner."""
+    pid = os.getppid()
+    for _ in range(12):
+        if pid <= 1:
+            return None
+        info = parent_of(pid)
+        if not info:
+            return None
+        ppid, exe = info
+        if os.path.basename(exe) == "claude" or "/claude/versions/" in exe:
+            return pid
+        pid = ppid
+    return None
+
+
+def alive(pid):
+    try:
+        os.kill(pid, 0)
+        return True
+    except OSError:
+        return False
+
+
 def listen():
-    """Block until a message arrives, print it and exit, which wakes the idle Claude session."""
+    """Block until a message arrives, print it and exit, which wakes the idle Claude session.
+
+    Only the newest listener of a session picks messages up, and a listener stops when its Claude Code session
+    goes away, so a leftover one can't take messages and print them where nobody reads them."""
+    parent, owner = os.getppid(), claude_owner()
+    if parent == 1:
+        sys.exit(f"Not listening: this listener is detached, so its output would reach no session. "
+                 f"Run `{LISTEN_CMD}` with the Bash tool and run_in_background=true, without nohup, & or redirects.")
     db = connect()
     me = register(db, os.getcwd())
     db.execute("UPDATE peers SET listener_pid = ? WHERE name = ?", (os.getpid(), me))
-    parent = os.getppid()
-    while os.getppid() == parent:  # stop when the owning session goes away
+    while os.getppid() == parent and (owner is None or alive(owner)):  # stop when the owning session goes away
+        row = db.execute("SELECT listener_pid FROM peers WHERE name = ?", (me,)).fetchone()
+        if not row or row["listener_pid"] != os.getpid():
+            print("A newer Bridge listener took over for this session, so this one stopped. "
+                  "Don't start another: the newer one is running.")
+            return
         touch(db, me)
         rows = take_unread(db, me)
         if rows:
